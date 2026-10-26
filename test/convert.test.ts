@@ -391,7 +391,7 @@ describe("openai SSE → anthropic SSE", () => {
         (tokens) => seen.push({ ...tokens }),
       ),
     );
-    expect(seen).toEqual([{ input: 5, output: 0 }, { input: 6, output: 1 }]);
+    expect(seen).toEqual([{ input: 6, output: 1 }]);
     expect(events.filter((e) => e.event === "message_delta").length).toBe(1);
     expect(events.filter((e) => e.event === "message_delta")[0]!.data.usage).toEqual({ input_tokens: 6, output_tokens: 1 });
   });
@@ -409,9 +409,27 @@ describe("openai SSE → anthropic SSE", () => {
         (tokens) => seen.push({ ...tokens }),
       ),
     );
-    expect(seen).toEqual([{ input: 6, output: 1 }, { input: 9, output: 1 }]);
+    expect(seen).toEqual([{ input: 9, output: 1 }]);
     expect(events.filter((e) => e.event === "message_delta").length).toBe(1);
-    expect(events.filter((e) => e.event === "message_delta")[0]!.data.usage).toEqual({ input_tokens: 6, output_tokens: 1 });
+    expect(events.filter((e) => e.event === "message_delta")[0]!.data.usage).toEqual({ input_tokens: 9, output_tokens: 1 });
+  });
+
+  test("usage on an early chunk survives a usage-less finish in message_delta, fed once", async () => {
+    const seen: Array<Record<string, number | undefined>> = [];
+    const events = await sseEvents(
+      convertOpenAiSse(
+        streamOf([
+          openaiChunk({ content: "a" }, null, { prompt_tokens: 5, completion_tokens: 0 }),
+          openaiChunk({ content: "b" }, "stop"),
+          "data: [DONE]\n\n",
+        ]),
+        "m",
+        (tokens) => seen.push({ ...tokens }),
+      ),
+    );
+    expect(seen).toEqual([{ input: 5, output: 0 }]);
+    expect(events.filter((e) => e.event === "message_delta").length).toBe(1);
+    expect(events.filter((e) => e.event === "message_delta")[0]!.data.usage).toEqual({ input_tokens: 5, output_tokens: 0 });
   });
 
   test("a non-SSE frame is skipped, not fatal", async () => {

@@ -489,6 +489,7 @@ interface StreamState {
   toolBlocks: Map<number, ToolBlockState>;
   sawToolCall: boolean;
   finishReason: string;
+  lastUsage: Record<string, unknown> | null;
   messageDeltaSent: boolean;
   messageStopSent: boolean;
   contentBlocksStopped: boolean;
@@ -581,7 +582,7 @@ function messageDeltaAndStop(state: StreamState, emit: SseEmitter, usage: Record
   }
 }
 
-function handleMessageChunk(chunk: unknown, requestedModel: string, state: StreamState, emit: SseEmitter, onUsage: ((tokens: ObservedTokens) => void) | undefined): void {
+function handleMessageChunk(chunk: unknown, requestedModel: string, state: StreamState, emit: SseEmitter): void {
   const root = asRecord(chunk);
   if (root === null) return;
   const id = asString(root["id"]);
@@ -611,8 +612,8 @@ function handleMessageChunk(chunk: unknown, requestedModel: string, state: Strea
   const choices = asArray(root["choices"]);
   const choice = choices !== null && choices.length > 0 ? asRecord(choices[0]) : null;
   if (choice === null) {
-    // a usage-only frame (empty choices) still feeds the hook and a pending message_delta
-    handleChunkUsage(root, state, emit, onUsage);
+    // a usage-only frame (empty choices) still records usage for the close-time delta
+    handleChunkUsage(root, state);
     return;
   }
   const deltaRecord = asRecord(choice["delta"]);
@@ -693,23 +694,19 @@ function handleMessageChunk(chunk: unknown, requestedModel: string, state: Strea
     finalContentEvents(state, emit);
   }
 
-  handleChunkUsage(root, state, emit, onUsage);
+  handleChunkUsage(root, state);
 }
 
-function handleChunkUsage(
-  root: Record<string, unknown>,
-  state: StreamState,
-  emit: SseEmitter,
-  onUsage: ((tokens: ObservedTokens) => void) | undefined,
-): void {
+function handleChunkUsage(root: Record<string, unknown>, state: StreamState): void {
   const usage = asRecord(root["usage"]);
-  if (usage !== null && onUsage !== undefined) onUsage(extractUsage(usage));
-  if (state.finishReason !== "" && usage !== null) messageDeltaAndStop(state, emit, usage);
+  if (usage !== null) state.lastUsage = usage;
 }
 
 /**
  * Rebuild an openai SSE body as anthropic SSE events. `onUsage` feeds the
- * stats counters from any chunk that carries usage, wherever it appears.
+ * stats counters once with the last usage the stream carried — openai's
+ * trailing usage-only chunk is the authoritative total, so an earlier
+ * usage-bearing chunk never double-counts.
  */
 export function convertOpenAiSse(
   upstream: ReadableStream<Uint8Array>,
@@ -729,6 +726,7 @@ export function convertOpenAiSse(
     toolBlocks: new Map(),
     sawToolCall: false,
     finishReason: "",
+    lastUsage: null,
     messageDeltaSent: false,
     messageStopSent: false,
     contentBlocksStopped: false,
@@ -737,6 +735,11 @@ export function convertOpenAiSse(
     async start(controller) {
       const emit: SseEmitter = (name, payload) => {
         controller.enqueue(encoder.encode(`event: ${name}\ndata: ${JSON.stringify(payload)}\n\n`));
+      };
+      const closeStream = (): void => {
+        finalContentEvents(state, emit);
+        messageDeltaAndStop(state, emit, state.lastUsage);
+        if (state.lastUsage !== null && onUsage !== undefined) onUsage(extractUsage(state.lastUsage));
       };
       const decoder = new TextDecoder();
       let buffered = "";
@@ -749,7 +752,7 @@ export function convertOpenAiSse(
         const payload = dataLines.join("\n");
         if (payload === "[DONE]") return true;
         try {
-          handleMessageChunk(JSON.parse(payload), requestedModel, state, emit, onUsage);
+          handleMessageChunk(JSON.parse(payload), requestedModel, state, emit);
         } catch {
           // a frame the JSON parser refuses is not a chat event; the stream continues
         }
@@ -766,8 +769,7 @@ export function convertOpenAiSse(
             const frame = buffered.slice(0, separator);
             buffered = buffered.slice(separator + SSE_FRAME_SEPARATOR.length);
             if (handleFrame(frame)) {
-              finalContentEvents(state, emit);
-              messageDeltaAndStop(state, emit, null);
+              closeStream();
               controller.close();
               return;
             }
@@ -775,8 +777,7 @@ export function convertOpenAiSse(
         }
         buffered += decoder.decode();
         const tail = handleFrame(buffered);
-        finalContentEvents(state, emit);
-        messageDeltaAndStop(state, emit, null);
+        closeStream();
         void tail;
         controller.close();
       } catch (err) {
