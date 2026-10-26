@@ -1,0 +1,34 @@
+repository: uwuclxdy/clauth-freebuff-proxy
+coverage:
+  paths:
+    - coverage/lcov.info
+  exclude:
+    - "node_modules/**"
+  acceptable: patch >= 70%
+  if: true
+codeToTestRatio:
+  code:
+    - "src/**/*.ts"
+  test:
+    - "test/**/*.ts"
+  if: true
+testExecutionTime:
+  steps:
+    - test (coverage)
+  if: true
+comment:
+  if: is_pull_request && !github.event.pull_request.head.repo.fork
+  updatePrevious: true
+  expandDetails: true
+  hideFooterLink: true
+  hideCoverageLink: true
+summary:
+  if: true
+report:
+  if: is_default_branch
+  datastores:
+    - github://uwuclxdy/clauth-freebuff-proxy@coverage/reports
+diff:
+  if: is_pull_request
+  datastores:
+    - github://uwuclxdy/clauth-freebuff-proxy@coverage/reports

@@ -1,0 +1,23 @@
+{
+  "name": "clauth-freebuff-proxy",
+  "version": "0.0.0",
+  "description": "a clauth proxy for freebuff.com's free tier, speaking the freebuff CLI's wire",
+  "type": "module",
+  "private": true,
+  "bin": {
+    "clauth-freebuff-proxy": "./src/index.ts"
+  },
+  "engines": {
+    "bun": ">=1.3.0"
+  },
+  "scripts": {
+    "check": "tsc --noEmit && bun test"
+  },
+  "dependencies": {
+    "clauth-proxy-core": "git+https://github.com/uwuclxdy/clauth-proxy-core.git#v0.1.0"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.4.2",
+    "typescript": "^7.0.2"
+  }
+}

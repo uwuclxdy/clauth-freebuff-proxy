@@ -1,0 +1,21 @@
+# CI: install, then the typecheck+test gate. The conformance and wire-parity
+# harnesses join here once they exist (see docs/todo.md).
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch: {}
+permissions:
+  contents: read
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - run: bun install --frozen-lockfile
+      - run: bunx tsc --noEmit
+      - run: bun test
