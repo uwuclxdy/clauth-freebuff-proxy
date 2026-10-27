@@ -4,6 +4,14 @@
 
 A clauth proxy built on `clauth-proxy-core`. It runs headless: clauth enables it, supervises it and holds its log.
 
+<p align="center">
+  <img src="https://cov.uwuclxdy.dev/badges/uwuclxdy/clauth-freebuff-proxy/coverage.svg" alt="coverage" />
+  <img src="https://cov.uwuclxdy.dev/badges/uwuclxdy/clauth-freebuff-proxy/ratio.svg" alt="code to test ratio" />
+  <img src="https://cov.uwuclxdy.dev/badges/uwuclxdy/clauth-freebuff-proxy/time.svg" alt="test execution time" />
+  <a href="#license"><img src="https://shields.uwuclxdy.dev/badge/license-MIT%20OR%20Apache--2.0-blue" alt="MIT OR Apache-2.0 license" /></a>
+</p>
+
+
 > [!WARNING]
 > freebuff's upstream says free mode is CLI-only and that direct API use may get accounts banned. This proxy impersonates the freebuff CLI's wire, as the other clauth proxies impersonate theirs. The deepseek models and `minimax/minimax-m3` train on your data. Use it at your own risk.
 
@@ -112,6 +120,33 @@ clauth supplies the first three. One account setting is declared, one action, tw
 
 `count_tokens` answers locally as `ceil(chars / 4)` over the request's text parts, system and tool results included, with no upstream call.
 
+## What it leaves out
+
+- No browser login, no poll door: the token is pasted.
+- No ads, streak reporting, agent validation or WARP: the upstream requires none of them for chat.
+- No quota of its own: the session figure reads the upstream session, and no other number is invented.
+- No UI of its own: the proxy serves the contract and nothing else.
+
+## Comparison
+
+The two other freebuff implementations this proxy was measured against put a different face on the same upstream:
+
+| | clauth-freebuff-proxy | free-buff-lol | Freebuff2API |
+|---|---|---|---|
+| client wire | Anthropic `/v1/messages`, converted both ways, streaming included | Anthropic face, but only non-streaming is converted; the stream is an openai SSE passed through | Anthropic, converted both ways |
+| integration | a clauth proxy: enabled, supervised and read through clauth | a standalone server with a dashboard | a standalone server |
+| ads, streaks, agent validation | only a side-effect-free streak probe at login | opportunistic calls, failures swallowed | never sent |
+
+## FAQ
+
+**How do I use freebuff's free models with Claude Code?** Put `clauth-freebuff-proxy` on `PATH`, run `clauth proxy enable freebuff`, paste a freebuff auth token through its account login, and point Claude Code at the proxy's loopback port with the inference key.
+
+**Does clauth-freebuff-proxy need the freebuff CLI installed?** No. The proxy speaks the CLI's wire itself; only the account's auth token is needed.
+
+**Which models are free, and which draw on the session pool?** The five `free` ids are the unlimited tier; the three `limited` ids draw on the daily one-hour session pool.
+
+**Can my freebuff account get banned?** freebuff's upstream says free mode is CLI-only and that direct API use may get accounts banned. The proxy sends the CLI's own wire; that is no guarantee.
+
 ## Development
 
 ```sh
@@ -122,9 +157,6 @@ bun run check:parity      # compares the proxy's upstream requests against the s
 
 The conformance run needs the `clauth` binary at `CLAUTH_BIN` or `~/.cargo/bin/clauth`.
 
-## What it leaves out
+## License
 
-- No browser login, no poll door: the token is pasted.
-- No ads, streak reporting, agent validation or WARP: the upstream requires none of them for chat.
-- No quota of its own: the session figure reads the upstream session, and no other number is invented.
-- No UI of its own: the proxy serves the contract and nothing else.
+MIT OR Apache-2.0, at your choice: [LICENSE-MIT](LICENSE-MIT) or [LICENSE-APACHE](LICENSE-APACHE).

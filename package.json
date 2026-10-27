@@ -2,6 +2,7 @@
   "name": "clauth-freebuff-proxy",
   "version": "0.0.0",
   "description": "a clauth proxy for freebuff.com's free tier, speaking the freebuff CLI's wire",
+  "license": "MIT OR Apache-2.0",
   "type": "module",
   "private": true,
   "bin": {
