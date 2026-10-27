@@ -40,6 +40,13 @@ export interface AnthropicTool {
   inputSchema: unknown;
 }
 
+export interface AnthropicToolChoice {
+  type: "auto" | "any" | "tool";
+  /** The named tool, set only for type "tool". */
+  name: string | undefined;
+  disableParallelToolUse: boolean;
+}
+
 export interface AnthropicThinking {
   type: "enabled" | "disabled" | "adaptive" | "auto";
   budgetTokens: number | null;
@@ -63,6 +70,7 @@ export interface ParsedAnthropicRequest {
   systemTexts: string[];
   messages: ParsedAnthropicMessage[];
   tools: AnthropicTool[];
+  toolChoice: AnthropicToolChoice | null;
   temperature: number | null;
   topP: number | null;
   stopSequences: string[] | null;
@@ -161,6 +169,21 @@ export function parseAnthropicRequest(body: unknown): ParsedAnthropicRequest {
       });
     }
   }
+  let toolChoice: AnthropicToolChoice | null = null;
+  const rawToolChoiceValue = root["tool_choice"];
+  if (rawToolChoiceValue !== undefined && rawToolChoiceValue !== null) {
+    const rawToolChoice = asRecord(rawToolChoiceValue);
+    if (rawToolChoice === null) throw new ConvertError("tool_choice must be an object");
+    const type = asString(rawToolChoice["type"]);
+    if (type !== "auto" && type !== "any" && type !== "tool") {
+      throw new ConvertError(`tool_choice type must be auto, any or tool, got ${JSON.stringify(type)}`);
+    }
+    const name = asString(rawToolChoice["name"]);
+    if (type === "tool" && (name === null || name === "")) {
+      throw new ConvertError("tool_choice of type tool needs the tool's name");
+    }
+    toolChoice = { type, name: name ?? undefined, disableParallelToolUse: rawToolChoice["disable_parallel_tool_use"] === true };
+  }
   const rawSystem = root["system"];
   const systemTexts = textPartsOf(rawSystem);
   const rawThinking = asRecord(root["thinking"]);
@@ -179,6 +202,7 @@ export function parseAnthropicRequest(body: unknown): ParsedAnthropicRequest {
     systemTexts,
     messages,
     tools,
+    toolChoice,
     temperature: asNumber(root["temperature"]),
     topP: asNumber(root["top_p"]),
     stopSequences,
@@ -288,6 +312,11 @@ export function toOpenAiBody(request: ParsedAnthropicRequest): Record<string, un
         parameters: tool.inputSchema,
       },
     }));
+  }
+  const choice = request.toolChoice;
+  if (choice !== null) {
+    body["tool_choice"] = choice.type === "auto" ? "auto" : choice.type === "any" ? "required" : { type: "function", function: { name: choice.name } };
+    if (choice.disableParallelToolUse) body["parallel_tool_calls"] = false;
   }
   const effort = reasoningEffortFor(request);
   if (effort !== null) body["reasoning_effort"] = effort;

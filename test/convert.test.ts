@@ -161,6 +161,29 @@ describe("anthropic → openai requests", () => {
     ]);
   });
 
+  test("tool_choice maps onto the openai forms; the parallel flag inverts", () => {
+    const auto = toOpenAiBody(parseAnthropicRequest({ model: "m", messages: [], tool_choice: { type: "auto" } }));
+    expect(auto.tool_choice).toBe("auto");
+    const any = toOpenAiBody(parseAnthropicRequest({ model: "m", messages: [], tool_choice: { type: "any" } }));
+    expect(any.tool_choice).toBe("required");
+    const tool = toOpenAiBody(parseAnthropicRequest({ model: "m", messages: [], tool_choice: { type: "tool", name: "get_weather" } }));
+    expect(tool.tool_choice).toEqual({ type: "function", function: { name: "get_weather" } });
+    const noParallel = toOpenAiBody(
+      parseAnthropicRequest({ model: "m", messages: [], tool_choice: { type: "auto", disable_parallel_tool_use: true } }),
+    );
+    expect(noParallel.tool_choice).toBe("auto");
+    expect(noParallel.parallel_tool_calls).toBe(false);
+    const plain = toOpenAiBody(parseAnthropicRequest({ model: "m", messages: [] }));
+    expect("tool_choice" in plain).toBe(false);
+    expect("parallel_tool_calls" in plain).toBe(false);
+  });
+
+  test("a malformed tool_choice names the defect", () => {
+    expect(() => parseAnthropicRequest({ model: "m", messages: [], tool_choice: "auto" })).toThrow(ConvertError);
+    expect(() => parseAnthropicRequest({ model: "m", messages: [], tool_choice: { type: "sometimes" } })).toThrow(ConvertError);
+    expect(() => parseAnthropicRequest({ model: "m", messages: [], tool_choice: { type: "tool" } })).toThrow(ConvertError);
+  });
+
   test("a malformed request names the defect", () => {
     expect(() => parseAnthropicRequest({ messages: [] })).toThrow(ConvertError);
     expect(() => parseAnthropicRequest({ model: "m", messages: "no" })).toThrow(ConvertError);
