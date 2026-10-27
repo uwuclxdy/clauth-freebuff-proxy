@@ -1,9 +1,10 @@
 /**
- * Shared machinery for the two harness drivers (scripts/conformance.ts,
- * scripts/parity.ts): loopback ports, 0600 secret files, logged child spawns,
- * one bounded wait, the paste login both drivers need, and the signal-safe
- * teardown that installs before any child exists — a Ctrl-C or CI cancel must
- * not orphan a proxy still serving with its valid admin-token file.
+ * Shared machinery for the harness drivers (scripts/conformance.ts,
+ * scripts/parity.ts, scripts/live.ts): loopback ports, 0600 secret files,
+ * logged child spawns, one bounded wait, the paste login every driver needs,
+ * and the signal-safe teardown that installs before any child exists — a
+ * Ctrl-C or CI cancel must not orphan a proxy still serving with its valid
+ * admin-token file.
  */
 
 import { spawn, type ChildProcess } from "node:child_process";
