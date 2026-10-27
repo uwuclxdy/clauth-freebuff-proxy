@@ -45,16 +45,16 @@ describe("header sets", () => {
   test("a null token drops the Authorization header", () => {
     const headers = upstreamHeaders("api", null);
     expect(headers.map(([name]) => name)).not.toContain("Authorization");
-    expect(headers).toContainEqual(["User-Agent", "Bun/1.3.11"]);
+    expect(headers).toContainEqual(["User-Agent", "Bun/1.3.14"]);
   });
 
   test("the user agent is the one difference between the classes", () => {
-    expect(upstreamHeaders("api", "t").find(([name]) => name === "User-Agent")).toEqual(["User-Agent", "Bun/1.3.11"]);
+    expect(upstreamHeaders("api", "t").find(([name]) => name === "User-Agent")).toEqual(["User-Agent", "Bun/1.3.14"]);
     expect(upstreamHeaders("chat", "t").find(([name]) => name === "User-Agent")).toEqual([
       "User-Agent",
-      "ai-sdk/openai-compatible/0.0.0-test/codebuff ai-sdk/provider-utils/3.0.20 runtime/browser",
+      "ai-sdk/openai-compatible/0.0.0-test/codebuff ai-sdk/provider-utils/3.0.25 runtime/browser",
     ]);
-    expect(upstreamHeaders("cli", "t").find(([name]) => name === "User-Agent")).toEqual(["User-Agent", "Freebuff-CLI/0.0.105"]);
+    expect(upstreamHeaders("cli", "t").find(([name]) => name === "User-Agent")).toEqual(["User-Agent", "Freebuff-CLI/0.2.34"]);
   });
 
   test("extra headers ride last without displacing the base set", () => {

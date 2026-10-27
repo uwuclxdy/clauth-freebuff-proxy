@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import {
+  cliSystemPrefix,
   ConvertError,
   convertOpenAiSse,
   countAnthropicTokens,
@@ -35,14 +36,19 @@ async function sseEvents(stream: ReadableStream<Uint8Array>): Promise<Array<{ ev
 }
 
 describe("anthropic → openai requests", () => {
-  test("a text-only user message becomes one string-content message, no system invented", () => {
+  test("the CLI prefix leads every chat; a text-only user message rides after it", () => {
     const body = toOpenAiBody(parseAnthropicRequest({ model: "minimax/minimax-m2.7", messages: [{ role: "user", content: "hi" }] }));
-    expect(body.messages).toEqual([{ role: "user", content: "hi" }]);
+    const messages = body.messages as Array<{ role: string; content: string }>;
+    expect(messages).toHaveLength(2);
+    expect(messages[0]!.role).toBe("system");
+    expect(messages[0]!.content.startsWith("You are Buffy, the coding agent behind Codebuff.")).toBe(true);
+    expect(messages[0]!.content).toContain("Current date: ");
+    expect(messages.slice(1)).toEqual([{ role: "user", content: "hi" }]);
     expect(body.model).toBe("minimax/minimax-m2.7");
     expect(body.stream).toBe(false);
   });
 
-  test("system blocks become one system message ahead of the conversation", () => {
+  test("system blocks join behind the CLI prefix, ahead of the conversation", () => {
     const body = toOpenAiBody(
       parseAnthropicRequest({
         model: "minimax/minimax-m2.7",
@@ -50,7 +56,12 @@ describe("anthropic → openai requests", () => {
         messages: [{ role: "user", content: "hi" }],
       }),
     );
-    expect(body.messages).toEqual([{ role: "system", content: "be brief\nuse tools" }, { role: "user", content: "hi" }]);
+    const messages = body.messages as Array<{ role: string; content: string }>;
+    expect(messages).toHaveLength(2);
+    expect(messages[0]!.role).toBe("system");
+    expect(messages[0]!.content.startsWith("You are Buffy, the coding agent behind Codebuff.")).toBe(true);
+    expect(messages[0]!.content.endsWith("be brief\nuse tools")).toBe(true);
+    expect(messages[1]).toEqual({ role: "user", content: "hi" });
   });
 
   test("tool_use rides assistant tool_calls; tool_result rides role tool; tools map to the openai form", () => {
@@ -68,7 +79,7 @@ describe("anthropic → openai requests", () => {
         tools: [{ name: "get_weather", description: "get weather", input_schema: { type: "object" } }],
       }),
     );
-    expect(body.messages).toEqual([
+    expect((body.messages as unknown[]).slice(1)).toEqual([
       { role: "user", content: "weather?" },
       { role: "assistant", tool_calls: [{ id: "call_1", type: "function", function: { name: "get_weather", arguments: '{"city":"SF"}' } }] },
       { role: "tool", tool_call_id: "call_1", content: "sunny" },
@@ -113,7 +124,7 @@ describe("anthropic → openai requests", () => {
         ],
       }),
     );
-    expect(body.messages).toEqual([
+    expect((body.messages as unknown[]).slice(1)).toEqual([
       {
         role: "user",
         content: [
@@ -146,7 +157,7 @@ describe("anthropic → openai requests", () => {
         messages: [{ role: "assistant", content: [{ type: "thinking", thinking: "hmm" }, { type: "thinking", thinking: "aha" }] }],
       }),
     );
-    expect(body.messages).toEqual([{ role: "assistant", content: "", reasoning_content: "hmm\n\naha" }]);
+    expect((body.messages as unknown[]).slice(1)).toEqual([{ role: "assistant", content: "", reasoning_content: "hmm\n\naha" }]);
   });
 
   test("a tool-calling assistant carries no empty content key", () => {
@@ -156,7 +167,7 @@ describe("anthropic → openai requests", () => {
         messages: [{ role: "assistant", content: [{ type: "tool_use", id: "call_1", name: "f", input: {} }] }],
       }),
     );
-    expect(body.messages).toEqual([
+    expect((body.messages as unknown[]).slice(1)).toEqual([
       { role: "assistant", tool_calls: [{ id: "call_1", type: "function", function: { name: "f", arguments: "{}" } }] },
     ]);
   });
@@ -193,11 +204,16 @@ describe("anthropic → openai requests", () => {
 });
 
 describe("count_tokens", () => {
-  test("ceil of the joined text chars over 4, system included", () => {
-    expect(countAnthropicTokens({ messages: [{ role: "user", content: "hello world" }] })).toBe(3);
-    expect(countAnthropicTokens({ system: "abc", messages: [{ role: "user", content: "hello world" }] })).toBe(4);
-    expect(countAnthropicTokens({ messages: [{ role: "user", content: [{ type: "text", text: "abcd" }] }] })).toBe(1);
-    expect(countAnthropicTokens({ messages: [{ role: "user", content: [{ type: "tool_result", tool_use_id: "t", content: "12345" }] }] })).toBe(2);
+  test("ceil of the joined text chars over 4, the injected opening included", () => {
+    const opening = cliSystemPrefix().length;
+    expect(countAnthropicTokens({ messages: [{ role: "user", content: "hello world" }] })).toBe(Math.ceil((opening + 1 + 11) / 4));
+    expect(countAnthropicTokens({ system: "abc", messages: [{ role: "user", content: "hello world" }] })).toBe(
+      Math.ceil((opening + 2 + 3 + 1 + 11) / 4),
+    );
+    expect(countAnthropicTokens({ messages: [{ role: "user", content: [{ type: "text", text: "abcd" }] }] })).toBe(Math.ceil((opening + 1 + 4) / 4));
+    expect(countAnthropicTokens({ messages: [{ role: "user", content: [{ type: "tool_result", tool_use_id: "t", content: "12345" }] }] })).toBe(
+      Math.ceil((opening + 1 + 5) / 4),
+    );
   });
 
   test("a malformed body is a ConvertError, not a wrong count", () => {

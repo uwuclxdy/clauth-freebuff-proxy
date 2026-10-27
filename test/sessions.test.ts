@@ -1,37 +1,39 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { assembleChatBody, ensureSession, runChat } from "../src/sessions.ts";
-import { expectMetadataShape } from "./metadata-shape.ts";
+import { ConvertError } from "../src/convert.ts";
+import { assembleChatBody, catalogueOf, dropCatalogue, endAccountSessions, instanceIdOf, runChat } from "../src/sessions.ts";
 
-// The session/run error paths, driven against one configurable loopback stub. Every
-// test uses its own account id so the module's per-account session map never
-// leaks between them, and gapMs 0 unless the debounce itself is the subject.
+// The sessionless chat chain, the per-account catalogue cache and the locally
+// minted instance id, driven against one configurable loopback stub. Every
+// test uses its own account id so the module's per-account state never leaks
+// between them, and gapMs 0 unless the debounce itself is the subject.
 
 interface RecordedRequest {
   method: string;
   path: string;
   authorization: string | null;
   instanceHeader: string | null;
-  modelHeader: string | null;
+  catalogHeader: string | null;
   body: any;
   at: number;
 }
 
 interface StubRoutes {
-  createSession?: () => Response;
-  getSession?: (instanceId: string | null) => Response;
+  models?: () => Response;
   deleteSession?: () => Response;
   agentRun?: (body: any) => Response | Promise<Response>;
   chat?: (body: any) => Response;
 }
 
 const TOKEN = "fa82b5c1-e39d-4c7a-961f-d2b3c4e5f6a7";
-const MODEL = "minimax/minimax-m2.7";
-const ACTIVE_SESSION = {
-  status: "active",
-  instanceId: "inst-1",
-  expiresAt: new Date(Date.now() + 3_600_000).toISOString(),
-  remainingMs: 3_600_000,
-  model: MODEL,
+const KEY = "m-0000000001";
+const HANDLE = "fbm1.sessions";
+const CLIENT_ID_RE = /^[0-9a-z]{10}$/;
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+const CLI_INSTANCE_RE = /^cli:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
+const CATALOGUE_BODY = {
+  version: "v0.test.1",
+  rows: [{ key: KEY, handle: HANDLE, displayName: "MiMo v2.6 Flash Slow", access: "open", dataUse: "service", premium: false }],
 };
 
 describe("sessions and runs", () => {
@@ -50,17 +52,22 @@ describe("sessions and runs", () => {
           path: url.pathname,
           authorization: req.headers.get("authorization"),
           instanceHeader: req.headers.get("x-freebuff-instance-id"),
-          modelHeader: req.headers.get("x-freebuff-model"),
+          catalogHeader: req.headers.get("x-freebuff-catalog-protocol"),
           body,
           at: Date.now(),
         });
-        if (url.pathname === "/api/v1/freebuff/session") {
-          if (req.method === "POST") return routes.createSession?.() ?? Response.json(ACTIVE_SESSION);
-          if (req.method === "GET") return routes.getSession?.(req.headers.get("x-freebuff-instance-id")) ?? Response.json(ACTIVE_SESSION);
-          if (req.method === "DELETE") return routes.deleteSession?.() ?? new Response(null, { status: 204 });
+        if (url.pathname === "/api/v1/freebuff/models" && req.method === "GET") {
+          return routes.models?.() ?? Response.json(CATALOGUE_BODY);
         }
-        if (url.pathname === "/api/v1/agent-runs" && req.method === "POST") return await (routes.agentRun?.(body) ?? Response.json({ runId: "run-1" }));
-        if (url.pathname === "/api/v1/chat/completions" && req.method === "POST") return routes.chat?.(body) ?? Response.json({ ok: true });
+        if (url.pathname === "/api/v1/freebuff/session" && req.method === "DELETE") {
+          return routes.deleteSession?.() ?? new Response(null, { status: 204 });
+        }
+        if (url.pathname === "/api/v1/agent-runs" && req.method === "POST") {
+          return await (routes.agentRun?.(body) ?? Response.json({ runId: "run-1" }));
+        }
+        if (url.pathname === "/api/v1/chat/completions" && req.method === "POST") {
+          return routes.chat?.(body) ?? Response.json({ ok: true });
+        }
         return new Response("stub: not found", { status: 404 });
       },
     });
@@ -73,128 +80,55 @@ describe("sessions and runs", () => {
     delete process.env.FREEBUFF_UPSTREAM_BASE_URL;
   });
 
-  const chatOnce = (accountId: string, gapMs = 0, model = MODEL) =>
+  const chatOnce = (accountId: string, gapMs = 0) =>
     runChat({
       accountId,
       token: TOKEN,
-      model,
-      body: { model, messages: [{ role: "user", content: "hi" }], stream: false },
+      model: KEY,
+      handle: HANDLE,
+      body: { model: HANDLE, messages: [{ role: "user", content: "hi" }], stream: false },
       gapMs,
     });
 
-  test("a sessionless account (404) chats without freebuff_instance_id, metadata exact", async () => {
-    recorded = [];
-    routes = { createSession: () => new Response("no session", { status: 404 }) };
-    const attempt = await chatOnce("acct-sessionless");
-    expect(attempt.response.status).toBe(200);
-    const chat = recorded.find((r) => r.path === "/api/v1/chat/completions");
-    expect(chat).toBeDefined();
-    expectMetadataShape(chat!.body.codebuff_metadata, "run-1", null);
-    expect(chat!.body.stop).toEqual(["cb_easp"]);
-    expect(chat!.body.provider).toEqual({ data_collection: "deny" });
-  });
-
-  test("a live session is created once and reused; the chat body dials the canonical id", async () => {
+  test("a chat is sessionless: START on the free-catalog agent, the cli: instance id rides the metadata", async () => {
     recorded = [];
     routes = {};
-    await chatOnce("acct-reuse");
-    await chatOnce("acct-reuse", 0, "minimax-m2.7");
-    const creates = recorded.filter((r) => r.method === "POST" && r.path === "/api/v1/freebuff/session");
-    expect(creates.length).toBe(1);
-    expect(creates[0]!.modelHeader).toBe(MODEL);
-    expect(creates[0]!.body).toEqual({});
-    const chats = recorded.filter((r) => r.path === "/api/v1/chat/completions");
-    expect(chats.length).toBe(2);
-    expect(chats[0]!.body.model).toBe(MODEL);
-    expect(chats[1]!.body.model).toBe(MODEL);
-    expectMetadataShape(chats[0]!.body.codebuff_metadata, "run-1", "inst-1");
-    const starts = recorded.filter((r) => r.path === "/api/v1/agent-runs" && r.body.action === "START");
-    expect(starts.length).toBe(2);
-    expect(starts[0]!.body).toEqual({ action: "START", agentId: "base2-free", ancestorRunIds: [] });
-  });
-
-  test("a queued session is polled until active, not cached queued", async () => {
-    recorded = [];
-    let polls = 0;
-    routes = {
-      createSession: () => Response.json({ ...ACTIVE_SESSION, status: "queued", estimatedWaitMs: 0 }),
-      getSession: () => {
-        polls += 1;
-        return polls === 1 ? Response.json({ ...ACTIVE_SESSION, status: "queued" }) : Response.json(ACTIVE_SESSION);
-      },
-    };
-    const entry = await ensureSession("acct-queued", TOKEN, MODEL);
-    expect(entry?.instanceId).toBe("inst-1");
-    const gets = recorded.filter((r) => r.method === "GET" && r.path === "/api/v1/freebuff/session");
-    expect(gets.length).toBe(2);
-    expect(gets[0]!.instanceHeader).toBe("inst-1");
-    expect(gets[1]!.instanceHeader).toBe("inst-1");
-  });
-
-  test("a queue that closes (ended) gets one invalidation and recreate", async () => {
-    recorded = [];
-    let polls = 0;
-    let recreated = false;
-    routes = {
-      createSession: () => {
-        if (recreated) return Response.json(ACTIVE_SESSION);
-        return Response.json({ ...ACTIVE_SESSION, status: "queued", estimatedWaitMs: 0 });
-      },
-      getSession: () => {
-        polls += 1;
-        return polls === 1 ? Response.json({ ...ACTIVE_SESSION, status: "queued" }) : Response.json({ ...ACTIVE_SESSION, status: "ended" });
-      },
-      deleteSession: () => {
-        recreated = true;
-        return new Response(null, { status: 204 });
-      },
-    };
-    const entry = await ensureSession("acct-queue-ended", TOKEN, MODEL);
-    expect(entry?.instanceId).toBe("inst-1");
-    expect(recorded.some((r) => r.method === "DELETE" && r.path === "/api/v1/freebuff/session")).toBe(true);
-  });
-
-  test("model_locked on create ends the held session and recreates for the requested model", async () => {
-    recorded = [];
-    let locked = true;
-    routes = {
-      createSession: () => (locked ? Response.json({ error: "model_locked", currentModel: "minimax/minimax-m3" }, { status: 409 }) : Response.json(ACTIVE_SESSION)),
-      deleteSession: () => {
-        locked = false;
-        return new Response(null, { status: 204 });
-      },
-    };
-    const entry = await ensureSession("acct-locked", TOKEN, MODEL);
-    expect(entry?.instanceId).toBe("inst-1");
-    const methods = recorded.map((r) => `${r.method} ${r.path}`);
-    expect(methods).toEqual(["POST /api/v1/freebuff/session", "DELETE /api/v1/freebuff/session", "POST /api/v1/freebuff/session"]);
-    expect(recorded.every((r) => r.modelHeader !== "minimax/minimax-m3")).toBe(true);
-  });
-
-  test("a 426 chat invalidates the session and retries once", async () => {
-    recorded = [];
-    let firstChat = true;
-    routes = {
-      chat: () => {
-        if (firstChat) {
-          firstChat = false;
-          return Response.json({ error: "freebuff_update_required" }, { status: 426 });
-        }
-        return Response.json({ ok: true });
-      },
-    };
-    const attempt = await chatOnce("acct-426");
+    const attempt = await chatOnce("acct-shape");
     expect(attempt.response.status).toBe(200);
-    const methods = recorded.map((r) => `${r.method} ${r.path}`);
-    expect(methods).toEqual([
-      "POST /api/v1/freebuff/session",
-      "POST /api/v1/agent-runs",
-      "POST /api/v1/chat/completions",
-      "DELETE /api/v1/freebuff/session",
-      "POST /api/v1/freebuff/session",
-      "POST /api/v1/agent-runs",
-      "POST /api/v1/chat/completions",
+    expect(recorded.some((r) => r.path === "/api/v1/freebuff/session")).toBe(false);
+    const starts = recorded.filter((r) => r.path === "/api/v1/agent-runs" && r.body.action === "START");
+    expect(starts).toHaveLength(1);
+    expect(starts[0]!.body).toEqual({ action: "START", agentId: "base3-free-catalog", ancestorRunIds: [] });
+    const chat = recorded.find((r) => r.path === "/api/v1/chat/completions");
+    expect(chat).toBeDefined();
+    expect(chat!.body.model).toBe(HANDLE);
+    expect(chat!.body.stop).toBeUndefined();
+    expect(chat!.body.provider).toEqual({ data_collection: "deny" });
+    const meta = chat!.body.codebuff_metadata as Record<string, unknown>;
+    expect(Object.keys(meta).sort()).toEqual([
+      "client_id",
+      "cost_mode",
+      "freebuff_client_env",
+      "freebuff_input_profile",
+      "freebuff_instance_id",
+      "freebuff_multi_session",
+      "llm_step_number",
+      "repo_snapshot",
+      "run_id",
+      "surface",
+      "trace_session_id",
     ]);
+    expect(meta.cost_mode).toBe("free");
+    expect(meta.run_id).toBe("run-1");
+    expect(meta.freebuff_multi_session).toBe("1");
+    expect(meta.surface).toBe("cli");
+    expect(meta.llm_step_number).toBe("1");
+    expect(meta.client_id).toMatch(CLIENT_ID_RE);
+    expect(meta.trace_session_id).toMatch(UUID_RE);
+    expect(meta.freebuff_instance_id).toMatch(CLI_INSTANCE_RE);
+    expect(String(meta.freebuff_client_env)).toMatch(/^v1;/);
+    expect(String(meta.freebuff_input_profile)).toMatch(/^v1;/);
+    expect(String(meta.repo_snapshot)).toMatch(/^\{/);
   });
 
   test("a lost run re-STARTs and retries the chat once", async () => {
@@ -212,11 +146,11 @@ describe("sessions and runs", () => {
     const attempt = await chatOnce("acct-runid");
     expect(attempt.response.status).toBe(200);
     const starts = recorded.filter((r) => r.path === "/api/v1/agent-runs" && r.body.action === "START");
-    expect(starts.length).toBe(2);
-    expect(recorded.filter((r) => r.path === "/api/v1/chat/completions").length).toBe(2);
+    expect(starts).toHaveLength(2);
+    expect(recorded.filter((r) => r.path === "/api/v1/chat/completions")).toHaveLength(2);
   });
 
-  test("a session_model_mismatch chat invalidates, recreates, and retries once", async () => {
+  test("a session_model_mismatch chat ends the server session once and retries", async () => {
     recorded = [];
     let firstChat = true;
     routes = {
@@ -225,7 +159,7 @@ describe("sessions and runs", () => {
           firstChat = false;
           return Response.json(
             { error: { type: "session_model_mismatch", message: "session bound to minimax/minimax-m3", lockedModel: "minimax/minimax-m3" } },
-            { status: 400 },
+            { status: 409 },
           );
         }
         return Response.json({ ok: true });
@@ -235,15 +169,14 @@ describe("sessions and runs", () => {
     expect(attempt.response.status).toBe(200);
     const methods = recorded.map((r) => `${r.method} ${r.path}`);
     expect(methods).toEqual([
-      "POST /api/v1/freebuff/session",
       "POST /api/v1/agent-runs",
       "POST /api/v1/chat/completions",
       "DELETE /api/v1/freebuff/session",
-      "POST /api/v1/freebuff/session",
       "POST /api/v1/agent-runs",
       "POST /api/v1/chat/completions",
     ]);
-    expect(recorded.every((r) => r.modelHeader !== "minimax/minimax-m3")).toBe(true);
+    const del = recorded.find((r) => r.method === "DELETE");
+    expect(del!.instanceHeader).toMatch(CLI_INSTANCE_RE);
   });
 
   test("a mismatch that survives the retry fails with both models named", async () => {
@@ -252,7 +185,7 @@ describe("sessions and runs", () => {
       chat: () =>
         Response.json(
           { error: { type: "session_model_mismatch", message: "session bound to minimax/minimax-m3", lockedModel: "minimax/minimax-m3" } },
-          { status: 400 },
+          { status: 409 },
         ),
     };
     let thrown: unknown = null;
@@ -263,19 +196,69 @@ describe("sessions and runs", () => {
     }
     expect(thrown).toBeInstanceOf(Error);
     expect((thrown as Error).message).toContain("minimax/minimax-m3");
-    expect((thrown as Error).message).toContain("minimax/minimax-m2.7");
-    expect(recorded.filter((r) => r.path === "/api/v1/chat/completions").length).toBe(2);
+    expect((thrown as Error).message).toContain(KEY);
+    expect(recorded.filter((r) => r.path === "/api/v1/chat/completions")).toHaveLength(2);
   });
 
-  test("an alias dials the canonical id on the session create and the chat body", async () => {
+  test("a freebuff_catalog_stale chat refetches the catalogue once and retries with the fresh handle", async () => {
     recorded = [];
-    routes = {};
-    const attempt = await chatOnce("acct-alias", 0, "minimax-m2.7");
+    let firstChat = true;
+    routes = {
+      chat: () => {
+        if (firstChat) {
+          firstChat = false;
+          return Response.json({ error: "freebuff_catalog_stale" }, { status: 409 });
+        }
+        return Response.json({ ok: true });
+      },
+      models: () =>
+        Response.json({
+          version: "v0.test.2",
+          rows: [{ key: KEY, handle: "fbm1.fresh", displayName: "MiMo v2.6 Flash Slow", access: "open", dataUse: "service", premium: false }],
+        }),
+    };
+    const attempt = await chatOnce("acct-stale");
     expect(attempt.response.status).toBe(200);
-    const create = recorded.find((r) => r.method === "POST" && r.path === "/api/v1/freebuff/session");
-    expect(create!.modelHeader).toBe(MODEL);
-    const chat = recorded.find((r) => r.path === "/api/v1/chat/completions");
-    expect(chat!.body.model).toBe(MODEL);
+    const methods = recorded.map((r) => `${r.method} ${r.path}`);
+    expect(methods).toEqual([
+      "POST /api/v1/agent-runs",
+      "POST /api/v1/chat/completions",
+      "GET /api/v1/freebuff/models",
+      "POST /api/v1/agent-runs",
+      "POST /api/v1/chat/completions",
+    ]);
+    const gets = recorded.filter((r) => r.path === "/api/v1/freebuff/models");
+    expect(gets).toHaveLength(1);
+    expect(gets[0]!.catalogHeader).toBe("1");
+    const chats = recorded.filter((r) => r.path === "/api/v1/chat/completions");
+    expect(chats[0]!.body.model).toBe(HANDLE);
+    expect(chats[1]!.body.model).toBe("fbm1.fresh");
+  });
+
+  test("a catalogue that stays stale after the refetch fails", async () => {
+    recorded = [];
+    routes = { chat: () => Response.json({ error: "freebuff_catalog_stale" }, { status: 409 }) };
+    let thrown: unknown = null;
+    try {
+      await chatOnce("acct-stale-persist");
+    } catch (err) {
+      thrown = err;
+    }
+    expect(thrown).toBeInstanceOf(Error);
+    expect((thrown as Error).message).toContain("freebuff_catalog_stale");
+    expect(recorded.filter((r) => r.path === "/api/v1/chat/completions")).toHaveLength(2);
+  });
+
+  test("a refetched catalogue that dropped the row is an unknown model", async () => {
+    routes = {
+      chat: () => Response.json({ error: "freebuff_catalog_stale" }, { status: 409 }),
+      models: () =>
+        Response.json({
+          version: "v0.test.2",
+          rows: [{ key: "m-other", handle: "fbm1.other", displayName: "Other", access: "open", dataUse: "service", premium: false }],
+        }),
+    };
+    await expect(chatOnce("acct-stale-gone")).rejects.toThrow(ConvertError);
   });
 
   test("a passthrough error body is rebuilt without the old framing headers", async () => {
@@ -294,13 +277,10 @@ describe("sessions and runs", () => {
     expect(attempt.response.headers.get("transfer-encoding")).toBeNull();
   });
 
-  test("two concurrent cold chats land their POSTs ≥ gap apart even when the first builds a session", async () => {
+  test("two concurrent cold chats land their POSTs ≥ gap apart even when the first's run START lags", async () => {
     recorded = [];
     let starts = 0;
     routes = {
-      // the first chat's run START lags 600 ms: its session caches long before
-      // its dial, so the second chat rides the cache and its POST lands while
-      // the first is still between setup and dial
       agentRun: (body) => {
         starts += 1;
         if (body.action === "START" && starts === 1) {
@@ -316,30 +296,6 @@ describe("sessions and runs", () => {
     const chats = recorded.filter((r) => r.path === "/api/v1/chat/completions");
     expect(chats.length).toBe(2);
     expect(Math.abs(chats[0]!.at - chats[1]!.at)).toBeGreaterThanOrEqual(140);
-  });
-
-  test("a queued session's poll never holds the dial gate", async () => {
-    recorded = [];
-    let firstCreate = true;
-    routes = {
-      createSession: () => {
-        if (firstCreate) {
-          firstCreate = false;
-          return Response.json({ ...ACTIVE_SESSION, status: "queued", estimatedWaitMs: 1200 });
-        }
-        return Response.json(ACTIVE_SESSION);
-      },
-    };
-    const started = Date.now();
-    const first = chatOnce("acct-gap-queued", 150);
-    await Bun.sleep(50);
-    const second = chatOnce("acct-gap-queued", 150);
-    await Promise.all([first, second]);
-    const chats = recorded.filter((r) => r.path === "/api/v1/chat/completions");
-    expect(chats.length).toBe(2);
-    // the first chat cannot dial before its ~1200 ms poll settles, so an early
-    // POST is the second chat's: the poll never blocked it
-    expect(chats[0]!.at).toBeLessThan(started + 1200);
   });
 
   test("FINISH closes the run with the completed shape", async () => {
@@ -376,17 +332,73 @@ describe("sessions and runs", () => {
     expect(requestGapMs({ request_gap_ms: -5 })).toBe(1300);
     expect(requestGapMs({ request_gap_ms: "250" })).toBe(1300);
   });
+
+  test("the catalogue is fetched once per account and cached; dropCatalogue forces a refetch", async () => {
+    recorded = [];
+    routes = {};
+    await catalogueOf("acct-cache", TOKEN);
+    await catalogueOf("acct-cache", TOKEN);
+    expect(recorded.filter((r) => r.path === "/api/v1/freebuff/models")).toHaveLength(1);
+    dropCatalogue("acct-cache");
+    await catalogueOf("acct-cache", TOKEN);
+    expect(recorded.filter((r) => r.path === "/api/v1/freebuff/models")).toHaveLength(2);
+    expect(recorded.every((r) => r.catalogHeader === "1")).toBe(true);
+  });
+
+  test("a 401 catalogue is login_required; an answer without rows is upstream trouble", async () => {
+    routes = { models: () => new Response(JSON.stringify({ error: "Invalid API key or user not found" }), { status: 401 }) };
+    let thrown: unknown = null;
+    try {
+      await catalogueOf("acct-401", TOKEN);
+    } catch (err) {
+      thrown = err;
+    }
+    expect(thrown).toBeInstanceOf(Error);
+    expect((thrown as Error).message).toContain("catalogue");
+    expect((thrown as Error).message).toContain("401");
+
+    routes = { models: () => Response.json({ version: "v1" }) };
+    await expect(catalogueOf("acct-no-rows", TOKEN)).rejects.toThrow("no rows");
+  });
+
+  test("each account mints one stable cli: instance id; different accounts differ", () => {
+    expect(instanceIdOf("acct-id-a")).toBe(instanceIdOf("acct-id-a"));
+    expect(instanceIdOf("acct-id-a")).toMatch(CLI_INSTANCE_RE);
+    expect(instanceIdOf("acct-id-b")).not.toBe(instanceIdOf("acct-id-a"));
+  });
+
+  test("endAccountSessions deletes the session with the account's instance id", async () => {
+    recorded = [];
+    routes = {};
+    await endAccountSessions("acct-end", TOKEN);
+    const dels = recorded.filter((r) => r.method === "DELETE" && r.path === "/api/v1/freebuff/session");
+    expect(dels).toHaveLength(1);
+    expect(dels[0]!.instanceHeader).toMatch(CLI_INSTANCE_RE);
+  });
 });
 
 describe("chat body assembly", () => {
-  test("the client's stop wins over the cb_easp default; the session id rides only when it exists", () => {
-    const session = { instanceId: "inst-9", model: "m", expiresAtEpoch: Number.MAX_SAFE_INTEGER };
-    const withStop = assembleChatBody({ model: "m", stop: ["END"] }, "run-1", session);
-    expect(withStop.stop).toEqual(["END"]);
-    expectMetadataShape(withStop.codebuff_metadata as Record<string, unknown>, "run-1", "inst-9");
-    const sessionless = assembleChatBody({ model: "m" }, "run-2", null);
-    expect(sessionless.stop).toEqual(["cb_easp"]);
-    expectMetadataShape(sessionless.codebuff_metadata as Record<string, unknown>, "run-2", null);
-    expect(sessionless.provider).toEqual({ data_collection: "deny" });
+  test("the measured CLI fields ride; a client stop survives and none is invented", () => {
+    const body = assembleChatBody({ model: "m", stop: ["END"] }, "run-1", "cli:11111111-2222-4333-8444-555555555555", "ff7xdk3ftw");
+    expect(body.stop).toEqual(["END"]);
+    const meta = body.codebuff_metadata as Record<string, unknown>;
+    expect(meta.freebuff_instance_id).toBe("cli:11111111-2222-4333-8444-555555555555");
+    expect(meta.freebuff_multi_session).toBe("1");
+    expect(meta.surface).toBe("cli");
+    expect(meta.cost_mode).toBe("free");
+    expect(meta.llm_step_number).toBe("1");
+    expect(meta.run_id).toBe("run-1");
+    expect(meta.client_id).toMatch(CLIENT_ID_RE);
+    expect(meta.trace_session_id).toMatch(UUID_RE);
+    expect(meta.freebuff_client_env).toBe(
+      "v1;in=1;out=1;tp=tmux;term=1;ct=1;sz=220x50;ci=0;ssh=0;l=0;p=shell;g=mux;osc=1;tzo=0;px=none;tls=1;ca=0;cde=none",
+    );
+    expect(meta.freebuff_input_profile).toBe("v1;tc=0;ke=0;mc=0;pc=0;pe=0;cps=0");
+    expect(meta.repo_snapshot).toBe(
+      '{"gitAvailable":true,"repositoryVisibility":"unknown","fileCount":1,"fileCountIsLowerBound":false,"testFileCount":0,"historyIsShallow":false,"changedFileCount":0,"changedFileScanTruncated":false}',
+    );
+    expect(body.provider).toEqual({ data_collection: "deny" });
+    const plain = assembleChatBody({ model: "m" }, "run-2", "cli:11111111-2222-4333-8444-555555555555", "ff7xdk3ftw");
+    expect("stop" in plain).toBe(false);
   });
 });

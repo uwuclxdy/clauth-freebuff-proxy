@@ -13,9 +13,9 @@ export type HeaderPair = [name: string, value: string];
 const ACCEPT_ENCODING = "gzip, deflate";
 
 const USER_AGENTS: Record<HeaderClass, string> = {
-  api: "Bun/1.3.11",
-  chat: "ai-sdk/openai-compatible/0.0.0-test/codebuff ai-sdk/provider-utils/3.0.20 runtime/browser",
-  cli: "Freebuff-CLI/0.0.105",
+  api: "Bun/1.3.14",
+  chat: "ai-sdk/openai-compatible/0.0.0-test/codebuff ai-sdk/provider-utils/3.0.25 runtime/browser",
+  cli: "Freebuff-CLI/0.2.34",
 };
 
 /** The base set + Authorization + the class's user agent; `extra` rides last.
@@ -97,6 +97,7 @@ export function retryAfterSeconds(res: { headers: { get(name: string): string | 
 }
 
 export const CHAT_PATH = "/api/v1/chat/completions";
+export const MODELS_PATH = "/api/v1/freebuff/models";
 export const SESSION_PATH = "/api/v1/freebuff/session";
 export const AGENT_RUNS_PATH = "/api/v1/agent-runs";
 export const STREAK_PATH = "/api/v1/freebuff/streak";

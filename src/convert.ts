@@ -252,16 +252,40 @@ function contentValue(parts: TextImagePart[]): string | Array<Record<string, unk
   );
 }
 
+/** The CLI prompt's fixed opening through the date label; the free-mode chat
+ * gate prefix-matches it, so every chat's first system message starts with
+ * it. */
+const CLI_SYSTEM_PREFIX_TEMPLATE =
+  "You are Buffy, the coding agent behind Codebuff. You help users with software engineering tasks: fixing bugs, adding functionality, refactoring, and explaining code.\n\nCurrent date: ";
+
+/** The measured 198-char opening, with the live date in the CLI's format. */
+export function cliSystemPrefix(now: Date = new Date()): string {
+  const date = new Intl.DateTimeFormat("en-US", { timeZone: "UTC", month: "long", day: "numeric", year: "numeric" }).format(now);
+  return `${CLI_SYSTEM_PREFIX_TEMPLATE}${date}.`;
+}
+
+/** The chat's opening system message: the CLI prefix, the client's own system
+ * text after it, never duplicated when the client already sent the prefix. */
+export function cliSystemMessage(clientText: string): string {
+  const prefix = cliSystemPrefix();
+  if (clientText === "") return prefix;
+  if (clientText.startsWith(prefix)) return clientText;
+  return `${prefix}\n\n${clientText}`;
+}
+
+/** The first system message every chat opens with. */
+function systemMessageText(request: ParsedAnthropicRequest): string {
+  return cliSystemMessage(request.systemTexts.length > 0 ? request.systemTexts.join("\n") : "");
+}
+
 /**
  * The openai chat body for a parsed request. The caller adds the freebuff
- * extension fields (`codebuff_metadata`, `provider`, the `stop` default) so a
- * request that fails before a dial never reaches this far.
+ * extension fields (`codebuff_metadata`, `provider`) so a request that fails
+ * before a dial never reaches this far.
  */
 export function toOpenAiBody(request: ParsedAnthropicRequest): Record<string, unknown> {
   const messages: Array<Record<string, unknown>> = [];
-  if (request.systemTexts.length > 0) {
-    messages.push({ role: "system", content: request.systemTexts.join("\n") });
-  }
+  messages.push({ role: "system", content: systemMessageText(request) });
   for (const message of request.messages) {
     if (message.role === "user") {
       const parts: TextImagePart[] = [];
@@ -474,7 +498,9 @@ export function countAnthropicTokens(body: unknown): number {
   const root = asRecord(body);
   if (root === null) throw new ConvertError("request body must be a JSON object");
   if (!Array.isArray(root["messages"])) throw new ConvertError("messages must be an array");
-  const parts: string[] = [...textPartsOf(root["system"])];
+  // the count approximates the body the proxy actually dials, so the injected
+  // system opening counts like the client's own text
+  const parts: string[] = [cliSystemMessage(textPartsOf(root["system"]).join("\n"))];
   for (const raw of root["messages"] as unknown[]) {
     const message = asRecord(raw);
     if (message === null) throw new ConvertError("each message must be an object");

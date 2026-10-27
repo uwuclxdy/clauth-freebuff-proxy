@@ -31,7 +31,7 @@ import {
   writeSecretFile,
 } from "./harness.ts";
 
-const MODEL = "minimax/minimax-m2.7";
+const MODEL = "claude-haiku-4-5";
 const ADMIN_TOKEN = randomBytes(32).toString("hex");
 export const BODY_CAP = 1 << 20;
 const SCRATCH_ROOT = process.env.LIVE_SCRATCH_DIR ?? join(tmpdir(), "clauth-freebuff-live");

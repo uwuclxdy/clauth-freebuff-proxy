@@ -1,6 +1,6 @@
 # clauth-freebuff-proxy
 
-**Spend freebuff's free tier from Claude Code: eight models, each account on its own browser login.**
+**Spend freebuff's free tier from Claude Code: the upstream model catalogue, each account on its own browser login.**
 
 A clauth proxy built on `clauth-proxy-core`. It runs headless: clauth enables it, supervises it and holds its log.
 
@@ -13,40 +13,37 @@ A clauth proxy built on `clauth-proxy-core`. It runs headless: clauth enables it
 
 
 > [!WARNING]
-> freebuff's upstream says free mode is CLI-only and that direct API use may get accounts banned. This proxy impersonates the freebuff CLI's wire, as the other clauth proxies impersonate theirs. The deepseek models and `minimax/minimax-m3` train on your data. Use it at your own risk.
+> freebuff's upstream says free mode is CLI-only and that direct API use may get accounts banned. This proxy impersonates the freebuff CLI's wire, as the other clauth proxies impersonate theirs, including the CLI's system-prompt opening shown under Models. Some catalogue models train on your data. Use it at your own risk.
 
 ## What it is
 
-Claude Code speaks Anthropic's `/v1/messages`; freebuff speaks an OpenAI-shaped chat wire behind a session per account and model, and an agent run per chat. The proxy sits between them on a loopback port: it answers the Anthropic request, dials freebuff with the CLI's own headers, and returns the answer as an Anthropic message or SSE stream.
+Claude Code speaks Anthropic's `/v1/messages`; freebuff speaks an OpenAI-shaped chat wire behind an agent run per chat and a model catalogue per account. The proxy sits between them on a loopback port: it answers the Anthropic request, dials freebuff with the CLI's own headers and prompt opening, and returns the answer as an Anthropic message or SSE stream.
 
 ## Models
 
-Each model below ships, mapped onto its freebuff agent. Any other model id answers `invalid_request`.
+The model list is the upstream's own catalogue, fetched per account (`GET /api/v1/freebuff/models`). A model is addressed by its catalogue `key` (for example `m-61c26317cc`) or by the slug of its display name (`mimo-v2-6-flash-slow`); the row's signed `handle` is what the chat body selects upstream. Every open row is offered; a row the account cannot use answers as the upstream does, and any id outside the catalogue answers `invalid_request`. `claude-haiku-4-5`, the model `clauth proxy check` sends, resolves to the catalogue's default open row.
 
-| model | tier | trains on data |
-|---|---|---|
-| `minimax/minimax-m2.7` | free | no |
-| `minimax/minimax-m3` | free | yes |
-| `deepseek/deepseek-v4-flash` | free | yes |
-| `mimo/mimo-v2.5` | free | no |
-| `google/gemini-3.1-flash-lite-preview` | free | no |
-| `deepseek/deepseek-v4-pro` | limited | yes |
-| `mimo/mimo-v2.5-pro` | limited | no |
-| `moonshotai/kimi-k2.6` | limited | no |
+Each row carries its own `access`, `dataUse` and `premium` flags from the catalogue; a row whose `dataUse` is `training` trains on your data. The free tier keeps its quota server-side and exposes only the live session's remaining time, so nothing here reports it.
 
-`free` models are the unlimited tier; `limited` models draw on the daily one-hour session pool. The upstream keeps that quota server-side and exposes only the live session's remaining time, so nothing here reports it.
+The free-mode chat is gated on the CLI's own system prompt, so every chat's first system message starts with this exact opening (the date is the live one):
 
-Training flags are informational: a training model is served like any other. Set the model in the clauth profile (or the request) by its canonical id; short aliases resolve too (`deepseek-v4-pro`, `deepseek-v4-flash`, `deepseek-v3.1-terminus` for the v4-pro, `mimo-v2.5-pro`, `mimo-v2.5`, `kimi-k2.6`, `minimax-m2.7`, `minimax-m3`, `gemini-3.1-flash-lite`). `claude-haiku-4-5`, the model `clauth proxy check` sends, resolves to `minimax/minimax-m2.7`.
+```text
+You are Buffy, the coding agent behind Codebuff. You help users with software engineering tasks: fixing bugs, adding functionality, refactoring, and explaining code.
+
+Current date: October 27, 2026.
+```
+
+A client's own system prompt follows it; when the client sends none, the opening rides alone.
 
 ## How it works
 
 | stage | what happens |
 |---|---|
 | login | the proxy runs the freebuff CLI's own login: a fingerprint-keyed code, the upstream login URL, and a status poll until the account's auth token arrives; a GET on the streak route validates it, with no side effect upstream |
-| session | one `POST /api/v1/freebuff/session` per account and model, cached until its expiry, polled while the upstream queues it; a 404 means the upstream runs sessionless and the chat proceeds without one |
+| session | chats run sessionless like the CLI; the upstream binds its session to the model on the first chat, and the `session` figure reads `GET /api/v1/freebuff/session` |
 | run | an agent run `START`s per chat and `FINISH`es once the answer is fully sent (on a stream, after the last byte) |
-| chat | the converted body carries `codebuff_metadata` (`run_id`, `client_id`, `trace_session_id`, `cost_mode: "free"`, and `freebuff_instance_id` when a session exists) and `provider.data_collection: "deny"` |
-| retries | one retry per error class: a dead run id, an invalidated session (426), a session bound to another model |
+| chat | the converted body selects the catalogue row's `handle` and carries the CLI's `codebuff_metadata` (`run_id`, `client_id`, `trace_session_id`, `cost_mode: "free"`, `freebuff_instance_id` as the proxy's local `cli:` id, the multi-session and `surface: "cli"` markers, and the client-env fields) plus `provider.data_collection: "deny"` |
+| retries | one retry per error class: a dead run id, a stale catalogue, a session bound to another model (its session ends once, then the chat retries) |
 | pacing | the account's chat requests are at least `request_gap_ms` apart, the gap the freebuff client itself keeps |
 
 ## Install
@@ -147,7 +144,7 @@ The two other freebuff implementations this proxy was measured against put a dif
 
 **Does clauth-freebuff-proxy need the freebuff CLI installed?** No. The proxy speaks the CLI's wire itself; only the account's auth token is needed.
 
-**Which models are free, and which draw on the session pool?** The five `free` ids are the unlimited tier; the three `limited` ids draw on the daily one-hour session pool.
+**Which models are free, and which draw on the session pool?** The catalogue's own flags decide: an `open` row without `premium` is the free tier, and a locked or premium row answers as the upstream does. The upstream keeps the daily one-hour session pool server-side.
 
 **Can my freebuff account get banned?** freebuff's upstream says free mode is CLI-only and that direct API use may get accounts banned. The proxy sends the CLI's own wire; that is no guarantee.
 

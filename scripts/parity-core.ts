@@ -1,25 +1,25 @@
 /**
  * The wire-parity comparator's pure core. The proxy's recorded upstream
- * requests compare against the shapes the protocol brief pins
- * (docs/research/freebuff-protocol-2026-10-26/brief.md rows c/d/e/f — the
- * brief is the parity reference, not a live client: the CLI ships its
- * protocol in a compiled binary, brief §sources). Each request classifies by
- * method + path (+ body action for the agent-runs pair); each class pins its
- * header set — the base six with the per-class user agent row f fixes, cli
- * for the session wire (row c), api for the client chain (row e), chat for
- * the completions wire — and its body's exact key set with volatile values
- * (token, client_id, trace_session_id, run ids) classed by shape.
+ * requests compare against the shapes the 2026-10-27 live-drift measurement
+ * pins (docs/research/freebuff-wire-2026-10-27-live-drift/wire-drift.md and
+ * cli-capture.jsonl — the capture is the parity reference, not a live
+ * client). Each request classifies by method + path (+ body action for the
+ * agent-runs pair); each class pins its header set — the base six with the
+ * per-class user agent, cli for the catalogue/session wire, api for the run
+ * chain, chat for the completions wire — and its body's exact key set with
+ * volatile values (token, client_id, trace_session_id, run ids, the minted
+ * cli: instance id) classed by shape.
  *
- * Residuals, named here and never waived silently: headers the brief leaves
+ * Residuals, named here and never waived silently: headers the wire leaves
  * to the runtime (content-type, content-length and their kin) are recorded
- * but never demanded; header order is not compared (the brief pins a set);
+ * but never demanded; header order is not compared (the capture pins a set);
  * the chat body's `messages` array compares as a container only — the
  * conversion's own mapping is convert.test.ts's domain; and `session-poll`
  * is timing-owned — the usage cadence produces polls independently of any
  * scenario, so their count never compares, their shape still does.
  */
 
-import { AGENT_RUNS_PATH, CHAT_PATH, CLI_LOGIN_CODE_PATH, CLI_LOGIN_STATUS_PATH, SESSION_PATH, STREAK_PATH } from "../src/transport.ts";
+import { AGENT_RUNS_PATH, CHAT_PATH, CLI_LOGIN_CODE_PATH, CLI_LOGIN_STATUS_PATH, MODELS_PATH, SESSION_PATH, STREAK_PATH } from "../src/transport.ts";
 
 export type HeaderPair = [name: string, value: string];
 
@@ -34,6 +34,7 @@ export interface RecordedRequest {
 }
 
 export type RequestClass =
+  | "models"
   | "session-create"
   | "session-poll"
   | "session-end"
@@ -54,16 +55,18 @@ export interface ParityFinding {
 }
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-const CLIENT_ID_RE = /^[0-9a-z]{13}$/;
+const CLIENT_ID_RE = /^[0-9a-z]{10}$/;
+const CLI_INSTANCE_RE = /^cli:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
-/** Row f's user agents, pinned as literals here: a pin never reads the code under test. */
+/** The capture's user agents, pinned as literals here: a pin never reads the code under test. */
 const CLASS_USER_AGENTS = {
-  api: "Bun/1.3.11",
-  chat: "ai-sdk/openai-compatible/0.0.0-test/codebuff ai-sdk/provider-utils/3.0.20 runtime/browser",
-  cli: "Freebuff-CLI/0.0.105",
+  api: "Bun/1.3.14",
+  chat: "ai-sdk/openai-compatible/0.0.0-test/codebuff ai-sdk/provider-utils/3.0.25 runtime/browser",
+  cli: "Freebuff-CLI/0.2.34",
 } as const;
 
 const CLASS_OF: Record<RequestClass, keyof typeof CLASS_USER_AGENTS> = {
+  models: "cli",
   "session-create": "cli",
   "session-poll": "cli",
   "session-end": "cli",
@@ -79,6 +82,7 @@ const CLASS_OF: Record<RequestClass, keyof typeof CLASS_USER_AGENTS> = {
 const UNAUTHENTICATED: ReadonlySet<RequestClass> = new Set(["login-code", "login-status"]);
 
 export function requestClass(req: RecordedRequest): RequestClass | null {
+  if (req.path === MODELS_PATH && req.method === "GET") return "models";
   if (req.path === SESSION_PATH) {
     if (req.method === "POST") return "session-create";
     if (req.method === "GET") return "session-poll";
@@ -101,7 +105,8 @@ export interface CompareContext {
   token: string;
   /** The stub origin host[:port] the Host header must name. */
   host: string;
-  /** The stub's session instance id. */
+  /** Retained for the parity driver's context: the sessionless wire mints its
+   * own `cli:` instance id, shape-checked where a request carries it. */
   instanceId: string;
 }
 
@@ -121,11 +126,13 @@ export interface ScenarioPins {
   expect: RequestClass[];
   /** Classes that must not appear. */
   forbid?: RequestClass[];
-  /** The agent id the run START must name (the model table's row for the requested model). */
+  /** The agent id the run START must name (the free-catalog agent). */
   agentId?: string;
-  /** The canonical model the session create must steer. */
+  /** The canonical model the session create must steer (a legacy class; the
+   * sessionless chat chain never dials it). */
   sessionModel?: string;
-  /** A session instance rides the chat metadata and the poll/end headers. */
+  /** Retained for the parity driver's pins; every chat carries its cli:
+   * instance id regardless. */
   sessionLive: boolean;
   chat?: ChatPins;
 }
@@ -169,12 +176,20 @@ function headerFindings(name: string, req: RecordedRequest, cls: RequestClass, p
     ...(UNAUTHENTICATED.has(cls) ? [] : ([["Authorization", `Bearer ${ctx.token}`]] as Array<[string, string]>)),
     ["User-Agent", CLASS_USER_AGENTS[CLASS_OF[cls]]],
   ];
+  if (cls === "models") {
+    want.push(["x-freebuff-catalog-protocol", "1"]);
+  }
   if (cls === "session-create") {
     if (pins.sessionModel === undefined) throw new Error("parity: a session-create pin needs the scenario's sessionModel");
     want.push(["x-freebuff-model", pins.sessionModel]);
   }
   if (cls === "session-end") {
-    want.push(["x-freebuff-instance-id", ctx.instanceId]);
+    // the sessionless wire mints its own instance id; a missing or
+    // differently shaped one reds
+    const got = headerValue(req, "x-freebuff-instance-id");
+    if (got === null || !CLI_INSTANCE_RE.test(got)) {
+      at("x-freebuff-instance-id", "a cli: uuid", got);
+    }
   }
   for (const [header, value] of want) {
     const got = headerValue(req, header);
@@ -184,10 +199,12 @@ function headerFindings(name: string, req: RecordedRequest, cls: RequestClass, p
     at("Authorization", "absent", headerValue(req, "Authorization"));
   }
   if (cls === "session-poll") {
-    // presence is timing-owned (a poll can race the first session create);
-    // a wrong id still reds
+    // presence is timing-owned (a poll can race the first chat); a
+    // differently shaped id still reds
     const got = headerValue(req, "x-freebuff-instance-id");
-    if (got !== null && got !== ctx.instanceId) at("x-freebuff-instance-id", `${JSON.stringify(ctx.instanceId)} when present`, got);
+    if (got !== null && !CLI_INSTANCE_RE.test(got)) {
+      at("x-freebuff-instance-id", "a cli: uuid when present", got);
+    }
   }
   return findings;
 }
@@ -200,14 +217,15 @@ function bodyFindings(name: string, req: RecordedRequest, cls: RequestClass, pin
   };
   const body = parseBody(req.bodyRaw);
   switch (cls) {
-    case "session-create": {
-      keySet(body, [], at);
-      break;
-    }
+    case "models":
     case "session-poll":
     case "session-end":
     case "streak": {
       if (req.bodyRaw !== null && req.bodyRaw !== "") at("this request carries no body");
+      break;
+    }
+    case "session-create": {
+      keySet(body, [], at);
       break;
     }
     case "login-code": {
@@ -282,19 +300,36 @@ function chatBodyFindings(name: string, req: RecordedRequest, body: Record<strin
   if (body["model"] !== chat.model) at(`model: want ${JSON.stringify(chat.model)}, got ${JSON.stringify(body["model"] ?? null)}`);
   if (body["stream"] !== chat.stream) at(`stream: want ${JSON.stringify(chat.stream)}, got ${JSON.stringify(body["stream"] ?? null)}`);
   if (!Array.isArray(body["messages"])) at(`messages: want an array, got ${JSON.stringify(body["messages"] ?? null)}`);
-  const wantStop = chat.stop ?? ["cb_easp"];
-  if (!sameJson(body["stop"] ?? null, wantStop)) at(`stop: want ${JSON.stringify(wantStop)}, got ${JSON.stringify(body["stop"] ?? null)}`);
+  if (chat.stop === undefined) {
+    if ("stop" in body) at(`stop: want absent, got ${JSON.stringify(body["stop"] ?? null)}`);
+  } else if (!sameJson(body["stop"] ?? null, chat.stop)) {
+    at(`stop: want ${JSON.stringify(chat.stop)}, got ${JSON.stringify(body["stop"] ?? null)}`);
+  }
   if (!sameJson(body["provider"] ?? null, { data_collection: "deny" })) {
     at(`provider: want exactly {"data_collection":"deny"}, got ${JSON.stringify(body["provider"] ?? null)}`);
   }
-  findings.push(...metadataFindings(name, req, body["codebuff_metadata"], pins, ctx));
+  findings.push(...metadataFindings(name, req, body["codebuff_metadata"]));
   for (const [key, want] of Object.entries(chat.fields ?? {})) {
     if (!sameJson(body[key] ?? null, want)) at(`${key}: want ${JSON.stringify(want)}, got ${JSON.stringify(body[key] ?? null)}`);
   }
   return findings;
 }
 
-function metadataFindings(name: string, req: RecordedRequest, raw: unknown, pins: ScenarioPins, ctx: CompareContext): ParityFinding[] {
+const CHAT_METADATA_KEYS = [
+  "client_id",
+  "cost_mode",
+  "freebuff_client_env",
+  "freebuff_input_profile",
+  "freebuff_instance_id",
+  "freebuff_multi_session",
+  "llm_step_number",
+  "repo_snapshot",
+  "run_id",
+  "surface",
+  "trace_session_id",
+];
+
+function metadataFindings(name: string, req: RecordedRequest, raw: unknown): ParityFinding[] {
   const findings: ParityFinding[] = [];
   const where = `chat ${req.method} ${req.path} codebuff_metadata`;
   const at = (detail: string): void => {
@@ -305,14 +340,14 @@ function metadataFindings(name: string, req: RecordedRequest, raw: unknown, pins
     return findings;
   }
   const meta = raw as Record<string, unknown>;
-  const wantKeys = pins.sessionLive
-    ? ["client_id", "cost_mode", "freebuff_instance_id", "run_id", "trace_session_id"]
-    : ["client_id", "cost_mode", "run_id", "trace_session_id"];
-  keySet(meta, wantKeys, at);
+  keySet(meta, CHAT_METADATA_KEYS, at);
   if (meta["cost_mode"] !== "free") at(`cost_mode: want "free", got ${JSON.stringify(meta["cost_mode"] ?? null)}`);
+  if (meta["freebuff_multi_session"] !== "1") at(`freebuff_multi_session: want "1", got ${JSON.stringify(meta["freebuff_multi_session"] ?? null)}`);
+  if (meta["surface"] !== "cli") at(`surface: want "cli", got ${JSON.stringify(meta["surface"] ?? null)}`);
+  if (meta["llm_step_number"] !== "1") at(`llm_step_number: want "1", got ${JSON.stringify(meta["llm_step_number"] ?? null)}`);
   const clientId = meta["client_id"];
   if (typeof clientId !== "string" || !CLIENT_ID_RE.test(clientId)) {
-    at(`client_id: want 13 base-36 chars, got ${JSON.stringify(clientId ?? null)}`);
+    at(`client_id: want 10 base-36 chars, got ${JSON.stringify(clientId ?? null)}`);
   }
   const trace = meta["trace_session_id"];
   if (typeof trace !== "string" || !UUID_RE.test(trace)) {
@@ -321,8 +356,18 @@ function metadataFindings(name: string, req: RecordedRequest, raw: unknown, pins
   if (typeof meta["run_id"] !== "string" || meta["run_id"] === "") {
     at(`run_id: want a non-empty string, got ${JSON.stringify(meta["run_id"] ?? null)}`);
   }
-  if (pins.sessionLive && meta["freebuff_instance_id"] !== ctx.instanceId) {
-    at(`freebuff_instance_id: want ${JSON.stringify(ctx.instanceId)}, got ${JSON.stringify(meta["freebuff_instance_id"] ?? null)}`);
+  const instanceId = meta["freebuff_instance_id"];
+  if (typeof instanceId !== "string" || !CLI_INSTANCE_RE.test(instanceId)) {
+    at(`freebuff_instance_id: want a cli: uuid, got ${JSON.stringify(instanceId ?? null)}`);
+  }
+  for (const field of ["freebuff_client_env", "freebuff_input_profile"] as const) {
+    const value = meta[field];
+    if (typeof value !== "string" || !value.startsWith("v1;")) {
+      at(`${field}: want a v1; descriptor, got ${JSON.stringify(value ?? null)}`);
+    }
+  }
+  if (typeof meta["repo_snapshot"] !== "string" || meta["repo_snapshot"] === "") {
+    at(`repo_snapshot: want a non-empty string, got ${JSON.stringify(meta["repo_snapshot"] ?? null)}`);
   }
   return findings;
 }

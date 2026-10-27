@@ -1,19 +1,22 @@
 /**
- * The per-account+model session cache and the chat run chain:
- * Q-c/Q-e): one freebuff session per account+model, one agent run per chat
- * (START → chat → FINISH), the request-gap debounce between an account's
- * chats, and the freebuff extension fields on the chat body. Every upstream
- * request the chain makes feeds the account's stats counters.
+ * The per-account upstream state and the sessionless chat run chain: the
+ * model catalogue fetched once per account (a 409 `freebuff_catalog_stale`
+ * asks for one refetch), the locally minted `cli:` instance id every chat
+ * and the session figure ride, one agent run per chat (START → chat →
+ * FINISH) on the free-catalog agent, the request-gap debounce between an
+ * account's chats, and the freebuff extension fields on the chat body. Every
+ * upstream request the chain makes feeds the account's stats counters.
  */
 
 import { randomUUID } from "node:crypto";
 import { AdapterError } from "clauth-proxy-core";
-import { mintSessionId } from "./convert.ts";
-import { resolveModel } from "./models.ts";
+import { ConvertError } from "./convert.ts";
+import { parseCatalogue, resolveRow, type Catalogue } from "./models.ts";
 import { recordUpstream } from "./stats.ts";
 import {
   AGENT_RUNS_PATH,
   CHAT_PATH,
+  MODELS_PATH,
   SESSION_PATH,
   retryAfterSeconds,
   upstreamRequest,
@@ -23,15 +26,24 @@ import {
   type UpstreamRequest,
 } from "./transport.ts";
 
-export interface SessionEntry {
-  instanceId: string;
-  /** The model the upstream actually bound (it may differ from the request). */
-  model: string;
-  expiresAtEpoch: number;
-}
+/** The run agent the CLI 0.2.34 free-catalog chats START. */
+const RUN_AGENT = "base3-free-catalog";
+const CATALOG_PROTOCOL = "1";
+/** The completion's gzip-recovery header, sent by the CLI on every chat. */
+const SSE_GZIP_RECOVERY: HeaderPair = ["x-freebuff-sse-gzip-recovery", "1"];
+
+// The CLI capture's own descriptor values (2026-10-27): the upstream has
+// only ever seen these exact strings from the official client.
+const CLI_CLIENT_ENV =
+  "v1;in=1;out=1;tp=tmux;term=1;ct=1;sz=220x50;ci=0;ssh=0;l=0;p=shell;g=mux;osc=1;tzo=0;px=none;tls=1;ca=0;cde=none";
+const CLI_INPUT_PROFILE = "v1;tc=0;ke=0;mc=0;pc=0;pe=0;cps=0";
+const CLI_REPO_SNAPSHOT =
+  '{"gitAvailable":true,"repositoryVisibility":"unknown","fileCount":1,"fileCountIsLowerBound":false,"testFileCount":0,"historyIsShallow":false,"changedFileCount":0,"changedFileScanTruncated":false}';
 
 interface AccountUpstream {
-  sessionsByModel: Map<string, SessionEntry>;
+  catalogue: Catalogue | null;
+  instanceId: string | null;
+  clientId: string | null;
   lastChatDialAt: number;
 }
 
@@ -40,7 +52,7 @@ const accounts = new Map<string, AccountUpstream>();
 function accountState(accountId: string): AccountUpstream {
   let entry = accounts.get(accountId);
   if (entry === undefined) {
-    entry = { sessionsByModel: new Map(), lastChatDialAt: 0 };
+    entry = { catalogue: null, instanceId: null, clientId: null, lastChatDialAt: 0 };
     accounts.set(accountId, entry);
   }
   return entry;
@@ -58,12 +70,23 @@ export function dropAccount(accountId: string): void {
   dialGates.delete(accountId);
 }
 
-/** Any live session's instance id, for the account-scoped session GET. */
-export function anyCachedInstanceId(accountId: string): string | null {
-  for (const entry of accountState(accountId).sessionsByModel.values()) {
-    if (entry.expiresAtEpoch > Date.now()) return entry.instanceId;
+/** The account's locally minted `cli:` instance id, minted on first use. */
+export function instanceIdOf(accountId: string): string {
+  const account = accountState(accountId);
+  if (account.instanceId === null) account.instanceId = `cli:${randomUUID()}`;
+  return account.instanceId;
+}
+
+/** The account's chat client id: the CLI capture shows a stable 10-character
+ * lowercase id across a conversation. */
+export function clientIdOf(accountId: string): string {
+  const account = accountState(accountId);
+  if (account.clientId === null) {
+    let out = "";
+    while (out.length < 10) out += Math.floor(Math.random() * 36).toString(36);
+    account.clientId = out.slice(0, 10);
   }
-  return null;
+  return account.clientId;
 }
 
 // ---- counted wire -----------------------------------------------------------
@@ -82,97 +105,41 @@ async function countedSend(accountId: string, req: UpstreamRequest): Promise<Res
   return res;
 }
 
-// ---- session wire -----------------------------------------------------------
-
-interface SessionBody {
-  status: string;
-  instanceId: string;
-  expiresAt: string;
-  estimatedWaitMs: number;
-  model: string;
-  currentModel: string;
-  error: string;
-}
-
-function readSessionBody(raw: unknown): SessionBody {
-  const body = typeof raw === "object" && raw !== null && !Array.isArray(raw) ? (raw as Record<string, unknown>) : {};
-  const stringAt = (key: string): string => (typeof body[key] === "string" ? (body[key] as string) : "");
-  const numberAt = (key: string): number => (typeof body[key] === "number" ? (body[key] as number) : 0);
-  return {
-    status: stringAt("status"),
-    instanceId: stringAt("instanceId"),
-    expiresAt: stringAt("expiresAt"),
-    estimatedWaitMs: numberAt("estimatedWaitMs"),
-    model: stringAt("model"),
-    currentModel: stringAt("currentModel"),
-    error: stringAt("error"),
-  };
-}
-
 function upstreamFailure(what: string, status: number, retryAfter: number | undefined): AdapterError {
   if (status === 401) return new AdapterError("login_required", `${what}: the token was rejected (${status})`);
   if (status === 429) return new AdapterError("rate_limited", `${what}: rate limited (${status})`, retryAfter);
   return new AdapterError("upstream_unavailable", `${what}: upstream answered ${status}`);
 }
 
-function sessionInvalid(status: number, body: SessionBody): boolean {
-  return status === 426 || body.error === "freebuff_update_required";
+// ---- the model catalogue ----------------------------------------------------
+
+/** Forget the cached catalogue; the next read refetches it. */
+export function dropCatalogue(accountId: string): void {
+  accountState(accountId).catalogue = null;
 }
 
-function sessionModelLocked(body: SessionBody): boolean {
-  return body.error === "model_locked";
-}
-
-/** The bound model a `session_model_mismatch` names. */
-function mismatchedModel(body: unknown): string | null {
-  if (typeof body !== "object" || body === null) return null;
-  const record = body as Record<string, unknown>;
-  const error = typeof record["error"] === "object" && record["error"] !== null ? (record["error"] as Record<string, unknown>) : {};
-  const locked = error["lockedModel"] ?? record["lockedModel"];
-  if (typeof locked === "string" && locked !== "") return locked;
-  const message = JSON.stringify(body);
-  const bound = /bound to ([a-zA-Z0-9][a-zA-Z0-9._/-]+)/.exec(message);
-  return bound?.[1] ?? null;
-}
-
-function isSessionModelMismatch(status: number, body: unknown): boolean {
-  if (status < 400 || status >= 500) return false;
-  return JSON.stringify(body ?? "").includes("session_model_mismatch");
-}
-
-interface SessionAnswer {
-  status: number;
-  body: SessionBody;
-  retryAfter: number | undefined;
-}
-
-async function createSession(accountId: string, token: string, model: string): Promise<SessionAnswer> {
+/** The account's model catalogue, fetched once and cached. */
+export async function catalogueOf(accountId: string, token: string): Promise<Catalogue> {
+  const account = accountState(accountId);
+  if (account.catalogue !== null) return account.catalogue;
   const { status, body, retryAfter } = await countedJson(accountId, {
-    path: SESSION_PATH,
-    method: "POST",
-    token,
-    headerClass: "cli",
-    body: {},
-    extraHeaders: [["x-freebuff-model", model]],
-    timeoutMs: 60_000,
-  });
-  return { status, body: readSessionBody(body), retryAfter };
-}
-
-async function getSession(accountId: string, token: string, instanceId: string | null): Promise<SessionAnswer> {
-  const extra: HeaderPair[] = instanceId === null ? [] : [["x-freebuff-instance-id", instanceId]];
-  const { status, body, retryAfter } = await countedJson(accountId, {
-    path: SESSION_PATH,
+    path: MODELS_PATH,
     method: "GET",
     token,
     headerClass: "cli",
-    extraHeaders: extra,
+    extraHeaders: [["x-freebuff-catalog-protocol", CATALOG_PROTOCOL]],
     timeoutMs: 60_000,
   });
-  return { status, body: readSessionBody(body), retryAfter };
+  if (status !== 200) throw upstreamFailure("catalogue", status, retryAfter);
+  const catalogue = parseCatalogue(body);
+  if (catalogue === null) throw new AdapterError("upstream_unavailable", "catalogue: the upstream answer carried no rows");
+  account.catalogue = catalogue;
+  return catalogue;
 }
 
-/** End one upstream session; a missing one (404) is already ended. */
+// ---- the session wire -------------------------------------------------------
+
+/** End the account's upstream session; a missing one (404) is already ended. */
 export async function endSession(accountId: string, token: string, instanceId: string | null): Promise<void> {
   const extra: HeaderPair[] = instanceId === null ? [] : [["x-freebuff-instance-id", instanceId]];
   const res = await countedSend(accountId, {
@@ -188,145 +155,20 @@ export async function endSession(accountId: string, token: string, instanceId: s
   throw upstreamFailure("session end", res.status, retryAfterSeconds(res));
 }
 
-const QUEUED_POLL_FLOOR_MS = 1000;
-const QUEUED_POLL_CAP_MS = 2000;
-const QUEUED_POLL_MAX_ATTEMPTS = 30;
-
-/**
- * Poll a queued session until it opens. Only `active` settles; `queued` keeps
- * polling. An ended/superseded session asks for the invalidation path; a
- * 404/none/disabled queue is a sessionless account.
- */
-async function pollQueuedSession(
-  accountId: string,
-  token: string,
-  instanceId: string,
-  estimatedWaitMs: number,
-): Promise<{ kind: "active"; body: SessionBody } | { kind: "invalidate" } | { kind: "sessionless" }> {
-  const delay = Math.min(Math.max(estimatedWaitMs, QUEUED_POLL_FLOOR_MS), QUEUED_POLL_CAP_MS);
-  for (let attempt = 0; attempt < QUEUED_POLL_MAX_ATTEMPTS; attempt++) {
-    await Bun.sleep(delay);
-    const { status, body, retryAfter } = await getSession(accountId, token, instanceId);
-    if (status === 404) return { kind: "sessionless" };
-    if (status < 200 || status >= 300) throw upstreamFailure("session poll", status, retryAfter);
-    if (body.status === "active") return { kind: "active", body };
-    if (body.status === "queued") continue;
-    if (body.status === "ended" || body.status === "superseded") return { kind: "invalidate" };
-    return { kind: "sessionless" };
-  }
-  throw new AdapterError("upstream_unavailable", "session poll: the queue never opened");
-}
-
-function entryFromBody(body: SessionBody, fallbackModel: string): SessionEntry | null {
-  const instanceId = body.instanceId.trim();
-  if (instanceId === "") return null;
-  const expiresAt = body.expiresAt === "" ? Number.POSITIVE_INFINITY : Date.parse(body.expiresAt);
-  return {
-    instanceId,
-    model: body.model !== "" ? body.model : fallbackModel,
-    expiresAtEpoch: Number.isFinite(expiresAt) ? expiresAt : Number.POSITIVE_INFINITY,
-  };
-}
-
-async function invalidateAccountSession(accountId: string, token: string): Promise<void> {
-  const account = accountState(accountId);
-  for (const entry of account.sessionsByModel.values()) {
-    await endSession(accountId, token, entry.instanceId);
-  }
-  account.sessionsByModel.clear();
-}
-
-/** End every session the account holds and forget them. */
+/** End the account's upstream session. */
 export async function endAccountSessions(accountId: string, token: string): Promise<void> {
-  await invalidateAccountSession(accountId, token);
+  await endSession(accountId, token, instanceIdOf(accountId));
 }
 
-/** Cache and answer a settled 2xx session; `recreates` bounds the invalidation retries. */
-async function settleSession(accountId: string, token: string, model: string, answer: SessionAnswer, recreates: number): Promise<SessionEntry | null> {
-  if (answer.body.status === "queued") {
-    const instanceId = answer.body.instanceId;
-    if (instanceId === "") throw upstreamFailure("session create (queued without an instance id)", answer.status, answer.retryAfter);
-    const polled = await pollQueuedSession(accountId, token, instanceId, answer.body.estimatedWaitMs);
-    if (polled.kind === "sessionless") return null;
-    if (polled.kind === "invalidate") {
-      if (recreates <= 0) throw new AdapterError("upstream_unavailable", "session create: the queue kept closing");
-      await endSession(accountId, token, instanceId);
-      const recreated = await createSession(accountId, token, model);
-      if (recreated.status === 404) return null;
-      if (recreated.status === 401 || recreated.status === 429 || recreated.status < 200 || recreated.status >= 300) {
-        throw upstreamFailure("session create", recreated.status, recreated.retryAfter);
-      }
-      return settleSession(accountId, token, model, recreated, recreates - 1);
-    }
-    const entry = entryFromBody(polled.body, model);
-    if (entry === null) return null;
-    accountState(accountId).sessionsByModel.set(entry.model, entry);
-    return entry;
-  }
-  if (answer.body.status !== "active") {
-    throw upstreamFailure(`session create (status ${answer.body.status})`, answer.status, answer.retryAfter);
-  }
-  const entry = entryFromBody(answer.body, model);
-  if (entry === null) throw upstreamFailure("session create (active without an instance id)", answer.status, answer.retryAfter);
-  accountState(accountId).sessionsByModel.set(entry.model, entry);
-  return entry;
-}
+// ---- the run chain ----------------------------------------------------------
 
-/**
- * The account's live session for one model, or null when the upstream runs
- * sessionless: a 404/none/disabled session, or a `model_locked` that survives
- * its end-and-recreate, is a legitimate chat path. A
- * 426 and a closed queue each get one invalidation-and-recreate, always for
- * the requested model; a queued session is polled until active.
- */
-export async function ensureSession(accountId: string, token: string, model: string): Promise<SessionEntry | null> {
-  const account = accountState(accountId);
-  const cached = account.sessionsByModel.get(model);
-  if (cached !== undefined && cached.expiresAtEpoch > Date.now()) return cached;
-  account.sessionsByModel.delete(model);
-
-  let created = await createSession(accountId, token, model);
-  if (created.status === 404) return null;
-  if (created.status === 401 || created.status === 429) {
-    throw upstreamFailure("session create", created.status, created.retryAfter);
-  }
-
-  if (sessionModelLocked(created.body)) {
-    await endSession(accountId, token, anyCachedInstanceId(accountId));
-    account.sessionsByModel.clear();
-    created = await createSession(accountId, token, model);
-    if (created.status === 404) return null;
-    if (created.status === 401 || created.status === 429) {
-      throw upstreamFailure("session create", created.status, created.retryAfter);
-    }
-    if (sessionModelLocked(created.body)) return null;
-  } else if (sessionInvalid(created.status, created.body)) {
-    await invalidateAccountSession(accountId, token);
-    created = await createSession(accountId, token, model);
-    if (created.status === 404) return null;
-    if (created.status === 401 || created.status === 429) {
-      throw upstreamFailure("session create", created.status, created.retryAfter);
-    }
-    if (sessionInvalid(created.status, created.body)) {
-      throw upstreamFailure("session create", created.status, created.retryAfter);
-    }
-  }
-
-  if (created.status < 200 || created.status >= 300) {
-    throw upstreamFailure("session create", created.status, created.retryAfter);
-  }
-  return settleSession(accountId, token, model, created, 1);
-}
-
-// ---- run chain --------------------------------------------------------------
-
-export async function startRun(accountId: string, token: string, agentId: string): Promise<string> {
+export async function startRun(accountId: string, token: string): Promise<string> {
   const { status, body, retryAfter } = await countedJson(accountId, {
     path: AGENT_RUNS_PATH,
     method: "POST",
     token,
     headerClass: "api",
-    body: { action: "START", agentId, ancestorRunIds: [] },
+    body: { action: "START", agentId: RUN_AGENT, ancestorRunIds: [] },
   });
   if (status === 401 || status === 429) throw upstreamFailure("run start", status, retryAfter);
   if (status < 200 || status >= 300) throw upstreamFailure("run start", status, retryAfter);
@@ -353,20 +195,25 @@ export async function finishRun(accountId: string, token: string, runId: string)
 
 // ---- the chat call ----------------------------------------------------------
 
-/** The freebuff extension fields on an openai chat body (the node proxy's shape). */
-export function assembleChatBody(converted: Record<string, unknown>, runId: string, session: SessionEntry | null): Record<string, unknown> {
+/** The freebuff extension fields on an openai chat body (the CLI 0.2.34 wire). */
+export function assembleChatBody(converted: Record<string, unknown>, runId: string, instanceId: string, clientId: string): Record<string, unknown> {
   const metadata: Record<string, unknown> = {
     run_id: runId,
-    client_id: mintSessionId(),
+    client_id: clientId,
     trace_session_id: randomUUID(),
     cost_mode: "free",
-    ...(session !== null ? { freebuff_instance_id: session.instanceId } : {}),
+    freebuff_instance_id: instanceId,
+    freebuff_multi_session: "1",
+    surface: "cli",
+    freebuff_client_env: CLI_CLIENT_ENV,
+    freebuff_input_profile: CLI_INPUT_PROFILE,
+    repo_snapshot: CLI_REPO_SNAPSHOT,
+    llm_step_number: "1",
   };
   return {
     ...converted,
     codebuff_metadata: metadata,
     provider: { data_collection: "deny" },
-    ...("stop" in converted ? {} : { stop: ["cb_easp"] }),
   };
 }
 
@@ -376,6 +223,28 @@ function isRunIdError(status: number, body: unknown): boolean {
   return message.includes("runid not found") || message.includes("runid not running");
 }
 
+function isCatalogStale(status: number, body: unknown): boolean {
+  if (status !== 409) return false;
+  return JSON.stringify(body ?? "").includes("freebuff_catalog_stale");
+}
+
+function isSessionModelMismatch(status: number, body: unknown): boolean {
+  if (status < 400 || status >= 500) return false;
+  return JSON.stringify(body ?? "").includes("session_model_mismatch");
+}
+
+/** The bound model a `session_model_mismatch` names. */
+function mismatchedModel(body: unknown): string | null {
+  if (typeof body !== "object" || body === null) return null;
+  const record = body as Record<string, unknown>;
+  const error = typeof record["error"] === "object" && record["error"] !== null ? (record["error"] as Record<string, unknown>) : {};
+  const locked = error["lockedModel"] ?? record["lockedModel"];
+  if (typeof locked === "string" && locked !== "") return locked;
+  const message = JSON.stringify(body);
+  const bound = /bound to ([a-zA-Z0-9][a-zA-Z0-9._/-]+)/.exec(message);
+  return bound?.[1] ?? null;
+}
+
 async function postChat(accountId: string, token: string, body: Record<string, unknown>, gapMs: number): Promise<Response> {
   await dialGate(accountId, gapMs);
   return countedSend(accountId, {
@@ -383,6 +252,7 @@ async function postChat(accountId: string, token: string, body: Record<string, u
     method: "POST",
     token,
     headerClass: "chat",
+    extraHeaders: [SSE_GZIP_RECOVERY],
     body,
     timeoutMs: 300_000,
   });
@@ -391,7 +261,10 @@ async function postChat(accountId: string, token: string, body: Record<string, u
 export interface ChatPlan {
   accountId: string;
   token: string;
+  /** The catalogue row key the client addressed; the chat answer reports it. */
   model: string;
+  /** The row's signed handle; the chat body's `model` field carries it. */
+  handle: string;
   body: Record<string, unknown>;
   gapMs: number;
 }
@@ -403,50 +276,50 @@ export interface ChatAttempt {
 }
 
 /**
- * One chat on the account's behalf: the session (sessionless tolerated), a
- * fresh agent run, the POST behind the account's dial gate, and one bounded
- * retry per error class — a dead run
- * (`runid not found`/`runid not running`), an invalidated session
- * (426/`freebuff_update_required`), and a `session_model_mismatch`.
+ * One sessionless chat on the account's behalf: a fresh agent run, the POST
+ * behind the account's dial gate, and one bounded retry per error class — a
+ * dead run (`runid not found`/`runid not running`), a stale catalogue
+ * (`freebuff_catalog_stale`, one refetch), and a `session_model_mismatch`
+ * (the server session ends once).
  */
 export async function runChat(plan: ChatPlan): Promise<ChatAttempt> {
   const { accountId, token, model, body: converted, gapMs } = plan;
-  const modelEntry = resolveModel(model);
-  if (modelEntry === null) throw new AdapterError("upstream_unavailable", `chat: unknown model ${JSON.stringify(model)}`);
-  const canonical = modelEntry.id;
-
-  let session = await ensureSession(accountId, token, canonical);
-  let runId = await startRun(accountId, token, modelEntry.agentId);
-  let response = await postChat(accountId, token, assembleChatBody({ ...converted, model: canonical }, runId, session), gapMs);
+  let handle = plan.handle;
+  let runId = await startRun(accountId, token);
+  let response = await postChat(accountId, token, assembleChatBody({ ...converted, model: handle }, runId, instanceIdOf(accountId), clientIdOf(accountId)), gapMs);
 
   let retriedRun = false;
-  let retriedInvalidation = false;
-  let retriedModelMismatch = false;
+  let retriedCatalog = false;
+  let retriedMismatch = false;
   for (;;) {
     if (response.status < 400) break;
     const errorBody = await readErrorBody(response);
     if (!retriedRun && isRunIdError(response.status, errorBody)) {
       retriedRun = true;
-      runId = await startRun(accountId, token, modelEntry.agentId);
-      response = await postChat(accountId, token, assembleChatBody({ ...converted, model: canonical }, runId, session), gapMs);
-    } else if (!retriedInvalidation && sessionInvalid(response.status, readSessionBody(errorBody))) {
-      retriedInvalidation = true;
-      await invalidateAccountSession(accountId, token);
-      session = await ensureSession(accountId, token, canonical);
-      runId = await startRun(accountId, token, modelEntry.agentId);
-      response = await postChat(accountId, token, assembleChatBody({ ...converted, model: canonical }, runId, session), gapMs);
+      runId = await startRun(accountId, token);
+      response = await postChat(accountId, token, assembleChatBody({ ...converted, model: handle }, runId, instanceIdOf(accountId), clientIdOf(accountId)), gapMs);
+    } else if (isCatalogStale(response.status, errorBody)) {
+      if (retriedCatalog) {
+        throw new AdapterError("upstream_unavailable", "chat: the refetched catalogue still answers freebuff_catalog_stale");
+      }
+      retriedCatalog = true;
+      dropCatalogue(accountId);
+      const fresh = resolveRow(await catalogueOf(accountId, token), model);
+      if (fresh === null) throw new ConvertError(`unknown model ${JSON.stringify(model)}`);
+      handle = fresh.handle;
+      runId = await startRun(accountId, token);
+      response = await postChat(accountId, token, assembleChatBody({ ...converted, model: handle }, runId, instanceIdOf(accountId), clientIdOf(accountId)), gapMs);
     } else if (isSessionModelMismatch(response.status, errorBody)) {
-      if (retriedModelMismatch) {
+      if (retriedMismatch) {
         throw new AdapterError(
           "upstream_unavailable",
-          `chat: the upstream session stays bound to ${JSON.stringify(mismatchedModel(errorBody) ?? "another model")} while ${JSON.stringify(canonical)} was requested`,
+          `chat: the upstream session stays bound to ${JSON.stringify(mismatchedModel(errorBody) ?? "another model")} while ${JSON.stringify(model)} was requested`,
         );
       }
-      retriedModelMismatch = true;
-      await invalidateAccountSession(accountId, token);
-      session = await ensureSession(accountId, token, canonical);
-      runId = await startRun(accountId, token, modelEntry.agentId);
-      response = await postChat(accountId, token, assembleChatBody({ ...converted, model: canonical }, runId, session), gapMs);
+      retriedMismatch = true;
+      await endSession(accountId, token, instanceIdOf(accountId));
+      runId = await startRun(accountId, token);
+      response = await postChat(accountId, token, assembleChatBody({ ...converted, model: handle }, runId, instanceIdOf(accountId), clientIdOf(accountId)), gapMs);
     } else {
       response = rebuildJsonResponse(response, errorBody);
       break;
@@ -466,10 +339,9 @@ const dialGates = new Map<string, Promise<void>>();
  * The dial gate, serialized per account through a promise-chain lock: the
  * chat POST dispatches only once the account's previous chat POST is `gapMs`
  * old, read off the shared last-dial timestamp under the gate. Only the
- * dispatch sits inside the gate — session and run setup never hold it, so a
- * queued session's poll cannot delay another chat's dial, and two concurrent
- * chats cannot both read the same last-dial time and dial inside the gap the
- * freebuff client itself keeps.
+ * dispatch sits inside the gate — run setup never holds it, so two
+ * concurrent chats cannot both read the same last-dial time and dial inside
+ * the gap the freebuff client itself keeps.
  */
 async function dialGate(accountId: string, gapMs: number): Promise<void> {
   const previous = dialGates.get(accountId) ?? Promise.resolve();

@@ -1,12 +1,18 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { rmSync } from "node:fs";
 import { join } from "node:path";
-import { expectMetadataShape } from "./metadata-shape.ts";
 
 const REPO = join(import.meta.dir, "..");
 const ADMIN_TOKEN = "0".repeat(64);
 const PASTE_TOKEN = "fa82b5c1-e39d-4c7a-961f-d2b3c4e5f6a7";
 const POLL_TOKEN = "11111111-2222-4333-8444-555555555555";
+/** The stub's two-row catalogue; row 1 is the default open row. */
+const CATALOGUE_ROWS = [
+  { key: "m-61c26317cc", handle: "fbm1.e2e.aaaa", displayName: "MiMo v2.6 Flash Slow", access: "open", dataUse: "service", premium: false },
+  { key: "m-9b8a7c6d5e", handle: "fbm1.e2e.bbbb", displayName: "DeepSeek V4 Flash", access: "open", dataUse: "training", premium: true },
+];
+const CHAT_KEY = "m-61c26317cc";
+const CHAT_HANDLE = "fbm1.e2e.aaaa";
 
 type RecordedRequest = {
   method: string;
@@ -18,8 +24,8 @@ type RecordedRequest = {
   body: unknown;
 };
 
-function openaiChunk(delta: unknown, finishReason: string | null, usage?: unknown): string {
-  return `data: ${JSON.stringify({ id: "chatcmpl-1", model: "minimax/minimax-m2.7", choices: [{ index: 0, delta, finish_reason: finishReason }], ...(usage === undefined ? {} : { usage }) })}\n\n`;
+function openaiChunk(delta: unknown, finishReason: string | null, model: string, usage?: unknown): string {
+  return `data: ${JSON.stringify({ id: "chatcmpl-1", model, choices: [{ index: 0, delta, finish_reason: finishReason }], ...(usage === undefined ? {} : { usage }) })}\n\n`;
 }
 
 /** What the stub's login status answers once the browser side has signed in. */
@@ -42,6 +48,9 @@ function makeStubUpstream(recorded: RecordedRequest[]): { port: number; stop: ()
       });
       if (req.method === "GET" && url.pathname === "/api/v1/freebuff/streak") {
         return Response.json({ streakDays: 3 });
+      }
+      if (req.method === "GET" && url.pathname === "/api/v1/freebuff/models") {
+        return Response.json({ protocol: 1, version: "v0.e2e.1", rows: CATALOGUE_ROWS });
       }
       if (req.method === "POST" && url.pathname === "/api/auth/cli/code") {
         return Response.json({
@@ -71,26 +80,28 @@ function makeStubUpstream(recorded: RecordedRequest[]): { port: number; stop: ()
             remainingMs: 3_600_000,
             accessTier: "free",
             countryCode: "DE",
-            model: "minimax/minimax-m2.7",
+            model: CHAT_KEY,
           });
         }
         if (req.method === "DELETE") return new Response(null, { status: 204 });
       }
       if (req.method === "POST" && url.pathname === "/api/v1/chat/completions") {
         const parsed = JSON.parse(body!);
+        const selected = CATALOGUE_ROWS.find((row) => row.handle === parsed.model);
+        const model = selected?.key ?? CHAT_KEY;
         if (parsed.stream === true) {
           const sse = [
-            openaiChunk({ role: "assistant" }, null),
-            openaiChunk({ content: "Hello" }, null),
-            openaiChunk({ content: " world" }, null),
-            openaiChunk({}, "stop", { prompt_tokens: 7, completion_tokens: 2, total_tokens: 9 }),
+            openaiChunk({ role: "assistant" }, null, model),
+            openaiChunk({ content: "Hello" }, null, model),
+            openaiChunk({ content: " world" }, null, model),
+            openaiChunk({}, "stop", model, { prompt_tokens: 7, completion_tokens: 2, total_tokens: 9 }),
             "data: [DONE]\n\n",
           ].join("");
           return new Response(sse, { headers: { "content-type": "text/event-stream" } });
         }
         return Response.json({
           id: "chatcmpl-1",
-          model: "minimax/minimax-m2.7",
+          model,
           choices: [{
             index: 0,
             message: {
@@ -290,7 +301,7 @@ describe("freebuff proxy e2e", () => {
       method: "POST",
       headers: { "x-api-key": inferenceKey, "content-type": "application/json" },
       body: JSON.stringify({
-        model: "minimax/minimax-m2.7",
+        model: CHAT_KEY,
         max_tokens: 256,
         stream: false,
         messages: [{ role: "user", content: "what is the weather in SF?" }],
@@ -301,7 +312,7 @@ describe("freebuff proxy e2e", () => {
     const body: any = await res.json();
     expect(body.type).toBe("message");
     expect(body.role).toBe("assistant");
-    expect(body.model).toBe("minimax/minimax-m2.7");
+    expect(body.model).toBe(CHAT_KEY);
     expect(body.stop_reason).toBe("tool_use");
     expect(body.content).toEqual([
       { type: "tool_use", id: "call_1", name: "get_weather", input: { city: "SF" } },
@@ -312,25 +323,34 @@ describe("freebuff proxy e2e", () => {
     const chat = recorded.filter((r) => r.path === "/api/v1/chat/completions").at(-1)!;
     const chatBody: any = chat.body;
     expect(chatBody.stream).toBe(false);
-    expect(chatBody.model).toBe("minimax/minimax-m2.7");
-    expect(chatBody.messages).toEqual([
+    expect(chatBody.model).toBe(CHAT_HANDLE);
+    expect(chatBody.messages).toHaveLength(2);
+    expect(chatBody.messages[0].role).toBe("system");
+    expect(chatBody.messages[0].content.startsWith("You are Buffy, the coding agent behind Codebuff.")).toBe(true);
+    expect(chatBody.messages.slice(1)).toEqual([
       { role: "user", content: "what is the weather in SF?" },
     ]);
     expect(chatBody.tools).toEqual([
       { type: "function", function: { name: "get_weather", description: "get weather", parameters: { type: "object", properties: { city: { type: "string" } } } } },
     ]);
-    expect(chatBody.codebuff_metadata.cost_mode).toBe("free");
-    expectMetadataShape(chatBody.codebuff_metadata, "run-1", "inst-1");
+    const meta = chatBody.codebuff_metadata;
+    expect(meta.cost_mode).toBe("free");
+    expect(meta.run_id).toBe("run-1");
+    expect(meta.freebuff_multi_session).toBe("1");
+    expect(meta.surface).toBe("cli");
+    expect(meta.freebuff_instance_id).toMatch(/^cli:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
+    expect(meta.client_id).toMatch(/^[0-9a-z]{10}$/);
     expect(chatBody.provider).toEqual({ data_collection: "deny" });
+    expect("stop" in chatBody).toBe(false);
     expect(chat.userAgent).toContain("ai-sdk/openai-compatible");
   });
 
-  test("streaming inference converts openai sse to anthropic sse events", async () => {
+  test("streaming inference converts openai sse to anthropic sse events, the model addressed by slug", async () => {
     const res = await fetch(`http://127.0.0.1:${port}/v1/messages`, {
       method: "POST",
       headers: { "x-api-key": inferenceKey, "content-type": "application/json" },
       body: JSON.stringify({
-        model: "minimax/minimax-m2.7",
+        model: "mimo-v2-6-flash-slow",
         max_tokens: 256,
         stream: true,
         messages: [{ role: "user", content: "say hi" }],
@@ -341,6 +361,7 @@ describe("freebuff proxy e2e", () => {
     const events = sseEvents(raw);
     const names = events.map((e) => e.event);
     expect(names[0]).toBe("message_start");
+    expect((events[0]!.data as any).message.model).toBe(CHAT_KEY);
     expect(names).toContain("content_block_start");
     expect(names.filter((n) => n === "content_block_delta").length).toBe(2);
     const deltas = events.filter((e) => e.event === "content_block_delta");
@@ -355,10 +376,11 @@ describe("freebuff proxy e2e", () => {
     const res = await fetch(`http://127.0.0.1:${port}/v1/messages/count_tokens`, {
       method: "POST",
       headers: { "x-api-key": inferenceKey, "content-type": "application/json" },
-      body: JSON.stringify({ model: "minimax/minimax-m2.7", messages: [{ role: "user", content: "hello world" }] }),
+      body: JSON.stringify({ model: "claude-haiku-4-5", messages: [{ role: "user", content: "hello world" }] }),
     });
     expect(res.status).toBe(200);
-    expect(await res.json()).toEqual({ input_tokens: 3 });
+    // the injected 198-char opening + "\n" + "hello world" = 210 chars -> ceil(210 / 4)
+    expect(await res.json()).toEqual({ input_tokens: 53 });
   });
 
   test("usage reads the session window and stats figures", async () => {

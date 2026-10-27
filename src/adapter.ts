@@ -1,8 +1,8 @@
 /**
  * The freebuff adapter: the manifest the core serves from, the login doors
- * (src/login.ts), the anthropic↔openai forward over the session/run chain
- * (src/sessions.ts + src/convert.ts), the session-window and stats figures,
- * and the `end-session` action.
+ * (src/login.ts), the anthropic↔openai forward over the sessionless run
+ * chain (src/sessions.ts + src/convert.ts), the session-window and stats
+ * figures, and the `end-session` action.
  */
 
 import {
@@ -21,13 +21,12 @@ import {
   parseAnthropicRequest,
   toAnthropicMessage,
   toOpenAiBody,
-  type ParsedAnthropicRequest,
 } from "./convert.ts";
 import { dropAccount } from "./sessions.ts";
 import { loginCancel, loginPaste, loginPoll, loginStart, tokenFromBlob } from "./login.ts";
-import { resolveModel } from "./models.ts";
+import { resolveRow } from "./models.ts";
 import { SESSION_PATH, upstreamRequestJson } from "./transport.ts";
-import { anyCachedInstanceId, endAccountSessions, requestGapMs, runChat } from "./sessions.ts";
+import { catalogueOf, endAccountSessions, instanceIdOf, requestGapMs, runChat } from "./sessions.ts";
 import { dropStats, recordTokens, statsCounters } from "./stats.ts";
 
 /** The freebuff session window's nominal length: one hour. */
@@ -44,58 +43,59 @@ function invalidRequest(message: string): Response {
 }
 
 async function forwardMessages(ctx: ForwardContext, token: string): Promise<Response> {
-  let parsed: ParsedAnthropicRequest;
   try {
-    parsed = parseAnthropicRequest(await ctx.request.json());
+    const parsed = parseAnthropicRequest(await ctx.request.json());
+    const catalogue = await catalogueOf(ctx.accountId, token);
+    const row = resolveRow(catalogue, parsed.model);
+    if (row === null) return invalidRequest(`unknown model ${JSON.stringify(parsed.model)}`);
+
+    const attempt = await runChat({
+      accountId: ctx.accountId,
+      token,
+      model: row.key,
+      handle: row.handle,
+      // the chat body dials the row's signed handle, never the client's id
+      body: toOpenAiBody({ ...parsed, model: row.handle }),
+      gapMs: requestGapMs(ctx.account.settings),
+    });
+
+    if (parsed.stream && attempt.response.ok) {
+      const upstreamBody = attempt.response.body;
+      if (upstreamBody === null) throw new AdapterError("upstream_unavailable", "chat: the upstream answer carried no body");
+      const converted = convertOpenAiSse(upstreamBody, row.key, (tokens) => recordTokens(ctx.accountId, tokens));
+      return new Response(
+        converted.pipeThrough(
+          new TransformStream<Uint8Array, Uint8Array>({
+            flush() {
+              return attempt.finish();
+            },
+          }),
+        ),
+        { status: 200, headers: { "content-type": "text/event-stream" } },
+      );
+    }
+
+    const text = await attempt.response.text();
+    let upstream: unknown;
+    try {
+      upstream = JSON.parse(text) as unknown;
+    } catch {
+      throw new AdapterError("upstream_unavailable", "chat: the upstream body was not JSON");
+    }
+    await attempt.finish();
+    if (!attempt.response.ok) {
+      // a non-2xx answer that survived the retries passes through; the core maps it by status
+      return new Response(JSON.stringify(upstream), {
+        status: attempt.response.status,
+        headers: { "content-type": "application/json" },
+      });
+    }
+    recordTokens(ctx.accountId, openAiUsageOf(upstream));
+    return Response.json(toAnthropicMessage(upstream, row.key));
   } catch (err) {
     if (err instanceof ConvertError) return invalidRequest(err.message);
     throw err;
   }
-  const model = resolveModel(parsed.model);
-  if (model === null) return invalidRequest(`unknown model ${JSON.stringify(parsed.model)}`);
-
-  const attempt = await runChat({
-    accountId: ctx.accountId,
-    token,
-    model: model.id,
-    // the chat body dials the canonical id, never the client's alias
-    body: toOpenAiBody({ ...parsed, model: model.id }),
-    gapMs: requestGapMs(ctx.account.settings),
-  });
-
-  if (parsed.stream && attempt.response.ok) {
-    const upstreamBody = attempt.response.body;
-    if (upstreamBody === null) throw new AdapterError("upstream_unavailable", "chat: the upstream answer carried no body");
-    const converted = convertOpenAiSse(upstreamBody, model.id, (tokens) => recordTokens(ctx.accountId, tokens));
-    return new Response(
-      converted.pipeThrough(
-        new TransformStream<Uint8Array, Uint8Array>({
-          flush() {
-            return attempt.finish();
-          },
-        }),
-      ),
-      { status: 200, headers: { "content-type": "text/event-stream" } },
-    );
-  }
-
-  const text = await attempt.response.text();
-  let upstream: unknown;
-  try {
-    upstream = JSON.parse(text) as unknown;
-  } catch {
-    throw new AdapterError("upstream_unavailable", "chat: the upstream body was not JSON");
-  }
-  await attempt.finish();
-  if (!attempt.response.ok) {
-    // a non-2xx answer that survived the retries passes through; the core maps it by status
-    return new Response(JSON.stringify(upstream), {
-      status: attempt.response.status,
-      headers: { "content-type": "application/json" },
-    });
-  }
-  recordTokens(ctx.accountId, openAiUsageOf(upstream));
-  return Response.json(toAnthropicMessage(upstream, model.id));
 }
 
 async function forward(ctx: ForwardContext): Promise<Response> {
@@ -138,7 +138,7 @@ async function readFigures(ctx: ReadFiguresContext): Promise<unknown> {
   if (token === null) throw new AdapterError("login_required", "usage: the account holds no freebuff token");
 
   const readAt = new Date().toISOString();
-  const instanceId = anyCachedInstanceId(ctx.accountId);
+  const instanceId = instanceIdOf(ctx.accountId);
   const { status, body, retryAfter } = await upstreamRequestJson({
     path: SESSION_PATH,
     method: "GET",
