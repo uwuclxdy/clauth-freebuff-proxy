@@ -6,7 +6,7 @@ coverage:
     - "test/**"
     - "scripts/**"
     - "node_modules/**"
-  acceptable: patch >= 70%
+  acceptable: patch >= 70% && current >= 90.3%
   if: true
 codeToTestRatio:
   code:
