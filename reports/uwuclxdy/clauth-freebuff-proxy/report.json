@@ -1,13 +1,13 @@
 {
   "repository": "uwuclxdy/clauth-freebuff-proxy",
   "ref": "refs/heads/mommy",
-  "commit": "ca95571fe5204a190e755b759bb49d144c2c83fe",
+  "commit": "95b379af9c340bc43689824e697eff20f3939455",
   "base_ref": "refs/heads/mommy",
   "coverage": {
     "type": "loc",
     "format": "LCOV",
-    "total": 1051,
-    "covered": 971,
+    "total": 1052,
+    "covered": 972,
     "files": [
       {
         "type": "loc",
@@ -4429,8 +4429,8 @@
         "type": "loc",
         "file": "src/origins.ts",
         "normalized_path": "src/origins.ts",
-        "total": 9,
-        "covered": 9,
+        "total": 10,
+        "covered": 10,
         "blocks": [
           {
             "type": "loc",
@@ -4490,8 +4490,15 @@
           },
           {
             "type": "loc",
-            "start_line": 19,
-            "end_line": 19,
+            "start_line": 22,
+            "end_line": 22,
+            "count": 178,
+            "count_u64": 178
+          },
+          {
+            "type": "loc",
+            "start_line": 23,
+            "end_line": 23,
             "count": 178,
             "count_u64": 178
           }
@@ -7432,8 +7439,8 @@
     ]
   },
   "code_to_test_ratio": {
-    "code": 1533,
-    "test": 1342,
+    "code": 1535,
+    "test": 1476,
     "code_files": [
       {
         "code": 207,
@@ -7471,9 +7478,9 @@
         "language": "TypeScript"
       },
       {
-        "code": 10,
-        "comment": 8,
-        "blank": 2,
+        "code": 12,
+        "comment": 9,
+        "blank": 3,
         "path": "src/origins.ts",
         "language": "TypeScript"
       },
@@ -7512,6 +7519,13 @@
         "comment": 2,
         "blank": 22,
         "path": "test/e2e.test.ts",
+        "language": "TypeScript"
+      },
+      {
+        "code": 134,
+        "comment": 1,
+        "blank": 16,
+        "path": "test/live.test.ts",
         "language": "TypeScript"
       },
       {
@@ -7566,5 +7580,5 @@
     ]
   },
   "test_execution_time": 8000000000,
-  "timestamp": "2026-10-27T08:04:16.651603253Z"
+  "timestamp": "2026-10-27T08:25:08.472816514Z"
 }
