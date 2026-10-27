@@ -16,15 +16,19 @@ if (!Number.isInteger(PORT) || PORT <= 0) {
 interface RecordedRequest {
   method: string;
   path: string;
+  search: string;
   headers: Array<[string, string]>;
   bodyRaw: string | null;
   at: number;
 }
 
 const recorded: RecordedRequest[] = [];
-const stats = { requests: 0, unmatched: 0, chats: 0 };
+const stats = { requests: 0, unmatched: 0, chats: 0, logins: 0 };
 
 const SESSION_MODEL = "minimax/minimax-m2.7";
+/** The token a browser login would hand back once the harness says a user signed in. */
+let loginToken: string | null = null;
+const LOGIN_HASH = "a".repeat(64);
 
 function activeSession(): Record<string, unknown> {
   return {
@@ -51,6 +55,23 @@ const SSE_ANSWER = [
 
 function route(method: string, path: string, bodyRaw: string | null): Response | null {
   if (method === "GET" && path === "/api/v1/freebuff/streak") return Response.json({ streakDays: 3 });
+  if (path === "/api/auth/cli/code" && method === "POST") {
+    stats.logins += 1;
+    const fingerprintId = bodyRaw === null ? "" : ((JSON.parse(bodyRaw) as Record<string, unknown>)["fingerprintId"] ?? "");
+    return Response.json({
+      loginUrl: "https://www.codebuff.com/login?auth_code=stub",
+      fingerprintId,
+      fingerprintHash: LOGIN_HASH,
+      expiresAt: Date.now() + 600_000,
+      expiresInMs: 600_000,
+    });
+  }
+  if (path === "/api/auth/cli/status" && method === "GET") {
+    if (loginToken === null) return new Response(JSON.stringify({ error: "Authentication failed" }), { status: 401 });
+    return Response.json({
+      user: { id: "user-1", email: "stub@example.com", name: "Stub User", authToken: loginToken, fingerprintId: "stub", fingerprintHash: LOGIN_HASH },
+    });
+  }
   if (path === "/api/v1/freebuff/session") {
     if (method === "POST" || method === "GET") return Response.json(activeSession());
     if (method === "DELETE") return new Response(null, { status: 204 });
@@ -79,12 +100,18 @@ async function handle(req: Request): Promise<Response> {
   if (url.pathname === "/__stub/healthz") return Response.json({ ok: true });
   if (url.pathname === "/__stub/stats") return Response.json(stats);
   if (url.pathname === "/__stub/requests") return Response.json({ requests: recorded });
+  if (url.pathname === "/__stub/login-ready" && req.method === "POST") {
+    const body = (JSON.parse(await req.text()) as Record<string, unknown>)["authToken"];
+    loginToken = typeof body === "string" ? body : null;
+    return Response.json({ ok: true });
+  }
 
   stats.requests += 1;
   const bodyRaw = req.method === "GET" || req.method === "DELETE" ? null : await req.text();
   recorded.push({
     method: req.method,
     path: url.pathname,
+    search: url.search,
     headers: [...req.headers.entries()],
     bodyRaw,
     at: Date.now(),

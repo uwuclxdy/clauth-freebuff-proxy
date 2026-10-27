@@ -6,6 +6,7 @@ import { expectMetadataShape } from "./metadata-shape.ts";
 const REPO = join(import.meta.dir, "..");
 const ADMIN_TOKEN = "0".repeat(64);
 const PASTE_TOKEN = "fa82b5c1-e39d-4c7a-961f-d2b3c4e5f6a7";
+const POLL_TOKEN = "11111111-2222-4333-8444-555555555555";
 
 type RecordedRequest = {
   method: string;
@@ -20,6 +21,9 @@ type RecordedRequest = {
 function openaiChunk(delta: unknown, finishReason: string | null, usage?: unknown): string {
   return `data: ${JSON.stringify({ id: "chatcmpl-1", model: "minimax/minimax-m2.7", choices: [{ index: 0, delta, finish_reason: finishReason }], ...(usage === undefined ? {} : { usage }) })}\n\n`;
 }
+
+/** What the stub's login status answers once the browser side has signed in. */
+let loginUserToken: string | null = null;
 
 function makeStubUpstream(recorded: RecordedRequest[]): { port: number; stop: () => void } {
   const server = Bun.serve({
@@ -38,6 +42,19 @@ function makeStubUpstream(recorded: RecordedRequest[]): { port: number; stop: ()
       });
       if (req.method === "GET" && url.pathname === "/api/v1/freebuff/streak") {
         return Response.json({ streakDays: 3 });
+      }
+      if (req.method === "POST" && url.pathname === "/api/auth/cli/code") {
+        return Response.json({
+          loginUrl: "https://www.codebuff.com/login?auth_code=e2e",
+          fingerprintId: "echoed",
+          fingerprintHash: "c".repeat(64),
+          expiresAt: Date.now() + 600_000,
+          expiresInMs: 600_000,
+        });
+      }
+      if (req.method === "GET" && url.pathname === "/api/auth/cli/status") {
+        if (loginUserToken === null) return new Response(JSON.stringify({ error: "Authentication failed" }), { status: 401 });
+        return Response.json({ user: { id: "user-1", email: "e2e@example.com", name: "E2E", authToken: loginUserToken } });
       }
       if (req.method === "POST" && url.pathname === "/api/v1/agent-runs") {
         return Response.json({ runId: "run-1" });
@@ -141,6 +158,9 @@ describe("freebuff proxy e2e", () => {
   let port = 0;
   let adminAuth = "";
   let inferenceKey = "";
+  /** The paste door's account; every later test targets it by id, since the
+   * browser-login test adds a second account. */
+  let pasteAccountId = "";
 
   beforeAll(async () => {
     recorded = [];
@@ -211,9 +231,8 @@ describe("freebuff proxy e2e", () => {
     expect(start.status).toBe(201);
     const startBody: any = await start.json();
     expect(startBody.state).toBe("pending");
-    expect(startBody.modes).toEqual(["paste"]);
-    expect(startBody.url).toBe("https://freebuff.llm.pm");
-
+    expect(startBody.modes).toEqual(["poll", "paste"]);
+    expect(startBody.url).toBe("https://www.codebuff.com/login?auth_code=e2e");
     const paste = await fetch(`http://127.0.0.1:${port}/clauth/v1/accounts/login/${startBody.flow}`, {
       method: "POST",
       headers: { authorization: adminAuth, "content-type": "application/json" },
@@ -226,16 +245,47 @@ describe("freebuff proxy e2e", () => {
     expect(pasteBody.inference_key).toMatch(/^clp_/);
     inferenceKey = pasteBody.inference_key;
     expect(pasteBody.account.plans).toEqual([{ id: "free", label: "Free" }]);
+    pasteAccountId = pasteBody.account.id;
 
     const probe = recorded.find((r) => r.path === "/api/v1/freebuff/streak");
     expect(probe).toBeDefined();
     expect(probe!.authorization).toBe(`Bearer ${PASTE_TOKEN}`);
   });
 
-  test("non-streaming inference converts anthropic tools to the openai wire and back", async () => {
-    const accounts: any = await (await fetch(`http://127.0.0.1:${port}/clauth/v1/accounts`, { headers: { authorization: adminAuth } })).json();
-    const accountId: string = accounts.accounts[0].id;
+  test("browser login completes once the upstream status reports the user", async () => {
+    loginUserToken = null;
+    const start = await fetch(`http://127.0.0.1:${port}/clauth/v1/accounts/login`, {
+      method: "POST",
+      headers: { authorization: adminAuth },
+      body: JSON.stringify({}),
+    });
+    expect(start.status).toBe(201);
+    const startBody: any = await start.json();
+    expect(startBody.modes).toEqual(["poll", "paste"]);
+    expect(startBody.url).toBe("https://www.codebuff.com/login?auth_code=e2e");
 
+    const status = async (): Promise<any> =>
+      await (await fetch(`http://127.0.0.1:${port}/clauth/v1/accounts/login/${startBody.flow}`, { headers: { authorization: adminAuth } })).json();
+    expect((await status()).state).toBe("pending");
+
+    loginUserToken = POLL_TOKEN;
+    const deadline = Date.now() + 15_000;
+    let done: any = null;
+    while (Date.now() < deadline) {
+      const body = await status();
+      if (body.state !== "pending") {
+        done = body;
+        break;
+      }
+      await Bun.sleep(500);
+    }
+    expect(done?.state).toBe("done");
+    expect(done.account.label).toBe("freebuff 1111…5555");
+    expect(done.inference_key).toMatch(/^clp_/);
+    loginUserToken = null;
+  }, 20_000);
+
+  test("non-streaming inference converts anthropic tools to the openai wire and back", async () => {
     const res = await fetch(`http://127.0.0.1:${port}/v1/messages`, {
       method: "POST",
       headers: { "x-api-key": inferenceKey, "content-type": "application/json" },
@@ -313,7 +363,8 @@ describe("freebuff proxy e2e", () => {
 
   test("usage reads the session window and stats figures", async () => {
     const usage: any = await (await fetch(`http://127.0.0.1:${port}/clauth/v1/usage`, { headers: { authorization: adminAuth } })).json();
-    const account = usage.accounts[0];
+    const account = usage.accounts.find((entry: any) => entry.account === pasteAccountId);
+    expect(account).toBeDefined();
     expect(account.state).toBe("ready");
     const window = account.figures.find((f: any) => f.kind === "window");
     expect(window).toBeDefined();
@@ -327,9 +378,7 @@ describe("freebuff proxy e2e", () => {
   });
 
   test("end-session action deletes the upstream session", async () => {
-    const accounts: any = await (await fetch(`http://127.0.0.1:${port}/clauth/v1/accounts`, { headers: { authorization: adminAuth } })).json();
-    const accountId: string = accounts.accounts[0].id;
-    const res = await fetch(`http://127.0.0.1:${port}/clauth/v1/accounts/${accountId}/actions/end-session`, {
+    const res = await fetch(`http://127.0.0.1:${port}/clauth/v1/accounts/${pasteAccountId}/actions/end-session`, {
       method: "POST",
       headers: { authorization: adminAuth, "content-type": "application/json" },
       body: JSON.stringify({}),

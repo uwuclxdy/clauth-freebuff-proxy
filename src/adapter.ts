@@ -1,5 +1,5 @@
 /**
- * The freebuff adapter: the manifest the core serves from, the paste login
+ * The freebuff adapter: the manifest the core serves from, the login doors
  * (src/login.ts), the anthropic↔openai forward over the session/run chain
  * (src/sessions.ts + src/convert.ts), the session-window and stats figures,
  * and the `end-session` action.

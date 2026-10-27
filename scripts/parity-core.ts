@@ -19,13 +19,15 @@
  * scenario, so their count never compares, their shape still does.
  */
 
-import { AGENT_RUNS_PATH, CHAT_PATH, SESSION_PATH, STREAK_PATH } from "../src/transport.ts";
+import { AGENT_RUNS_PATH, CHAT_PATH, CLI_LOGIN_CODE_PATH, CLI_LOGIN_STATUS_PATH, SESSION_PATH, STREAK_PATH } from "../src/transport.ts";
 
 export type HeaderPair = [name: string, value: string];
 
 export interface RecordedRequest {
   method: string;
   path: string;
+  /** The raw query string, leading `?` included; absent reads as no query. */
+  search?: string;
   headers: HeaderPair[];
   bodyRaw: string | null;
   at: number;
@@ -38,7 +40,9 @@ export type RequestClass =
   | "run-start"
   | "run-finish"
   | "chat"
-  | "streak";
+  | "streak"
+  | "login-code"
+  | "login-status";
 
 export type FindingKind = "missing-request" | "unexpected-request" | "header" | "body-field";
 
@@ -67,7 +71,12 @@ const CLASS_OF: Record<RequestClass, keyof typeof CLASS_USER_AGENTS> = {
   "run-finish": "api",
   chat: "chat",
   streak: "api",
+  "login-code": "api",
+  "login-status": "api",
 };
+
+/** The CLI's login routes answer before any account exists, so they carry no credential. */
+const UNAUTHENTICATED: ReadonlySet<RequestClass> = new Set(["login-code", "login-status"]);
 
 export function requestClass(req: RecordedRequest): RequestClass | null {
   if (req.path === SESSION_PATH) {
@@ -82,6 +91,8 @@ export function requestClass(req: RecordedRequest): RequestClass | null {
   }
   if (req.path === CHAT_PATH && req.method === "POST") return "chat";
   if (req.path === STREAK_PATH && req.method === "GET") return "streak";
+  if (req.path === CLI_LOGIN_CODE_PATH && req.method === "POST") return "login-code";
+  if (req.path === CLI_LOGIN_STATUS_PATH && req.method === "GET") return "login-status";
   return null;
 }
 
@@ -155,7 +166,7 @@ function headerFindings(name: string, req: RecordedRequest, cls: RequestClass, p
     ["Accept-Encoding", "gzip, deflate"],
     ["Connection", "keep-alive"],
     ["Host", ctx.host],
-    ["Authorization", `Bearer ${ctx.token}`],
+    ...(UNAUTHENTICATED.has(cls) ? [] : ([["Authorization", `Bearer ${ctx.token}`]] as Array<[string, string]>)),
     ["User-Agent", CLASS_USER_AGENTS[CLASS_OF[cls]]],
   ];
   if (cls === "session-create") {
@@ -168,6 +179,9 @@ function headerFindings(name: string, req: RecordedRequest, cls: RequestClass, p
   for (const [header, value] of want) {
     const got = headerValue(req, header);
     if (got !== value) at(header, JSON.stringify(value), got);
+  }
+  if (UNAUTHENTICATED.has(cls) && headerValue(req, "Authorization") !== null) {
+    at("Authorization", "absent", headerValue(req, "Authorization"));
   }
   if (cls === "session-poll") {
     // presence is timing-owned (a poll can race the first session create);
@@ -194,6 +208,24 @@ function bodyFindings(name: string, req: RecordedRequest, cls: RequestClass, pin
     case "session-end":
     case "streak": {
       if (req.bodyRaw !== null && req.bodyRaw !== "") at("this request carries no body");
+      break;
+    }
+    case "login-code": {
+      keySet(body, ["fingerprintId"], at);
+      const fingerprintId = body["fingerprintId"];
+      if (typeof fingerprintId !== "string" || fingerprintId === "") at(`fingerprintId: want a non-empty string, got ${JSON.stringify(fingerprintId ?? null)}`);
+      break;
+    }
+    case "login-status": {
+      if (req.bodyRaw !== null && req.bodyRaw !== "") at("this request carries no body");
+      const query = new URLSearchParams(req.search ?? "");
+      keySet(Object.fromEntries(query), ["fingerprintId", "fingerprintHash", "expiresAt"], at);
+      for (const name of ["fingerprintId", "fingerprintHash"]) {
+        const value = query.get(name);
+        if (value === null || value === "") at(`${name}: want a non-empty query value, got ${JSON.stringify(value)}`);
+      }
+      const expiresAt = query.get("expiresAt");
+      if (expiresAt === null || !/^\d+$/.test(expiresAt)) at(`expiresAt: want epoch milliseconds, got ${JSON.stringify(expiresAt)}`);
       break;
     }
     case "run-start": {

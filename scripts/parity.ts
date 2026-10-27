@@ -37,8 +37,10 @@ const USER_TEXT = [{ role: "user", content: "hi" }];
 const WEATHER_TOOL = { name: TOOL_NAME, description: "get weather", input_schema: { type: "object", properties: { city: { type: "string" } } } };
 const OPENAI_WEATHER = { type: "function", function: { name: TOOL_NAME, description: "get weather", parameters: { type: "object", properties: { city: { type: "string" } } } } };
 
-const FORBIDDEN_EXCEPT_POLL: RequestClass[] = ["session-create", "session-end", "run-start", "run-finish", "chat", "streak"];
-const FORBIDDEN_EXCEPT_POLL_AND_STREAK: RequestClass[] = ["session-create", "session-end", "run-start", "run-finish", "chat"];
+const FORBIDDEN_EXCEPT_POLL: RequestClass[] = ["session-create", "session-end", "run-start", "run-finish", "chat", "streak", "login-code", "login-status"];
+// the usage cadence emits session polls independently of any scenario, so their
+// count never compares; the login slice leaves them un-forbidden for the same reason
+const LOGIN_SLICE_FORBIDDEN: RequestClass[] = ["session-create", "session-end", "run-start", "run-finish", "chat"];
 
 interface Answer {
   status: number;
@@ -173,18 +175,20 @@ async function main(): Promise<void> {
     const findings: ParityFinding[] = [];
     let requestsTotal = 0;
 
-    // The login slice: the streak probe the paste door validates through, and
-    // nothing else on the freebuff wire.
+    // The login slice: the CLI's own login code the flow starts on, then the
+    // streak probe the pasted token validates through, and nothing else on the
+    // freebuff wire. A status poll may race the paste, so it is checked but not
+    // required.
     const loginReqs = await stub.requests();
     requestsTotal += loginReqs.length;
     const loginFindings = compareScenario(
-      "paste login probes the streak",
+      "paste login starts a code and probes the streak",
       loginReqs,
-      { expect: ["streak"], forbid: FORBIDDEN_EXCEPT_POLL_AND_STREAK, sessionLive: false },
+      { expect: ["login-code", "streak"], forbid: LOGIN_SLICE_FORBIDDEN, sessionLive: false },
       ctx,
     );
     findings.push(...loginFindings);
-    console.log(`parity: paste login probes the streak: ${loginFindings.length === 0 ? "ok" : `${loginFindings.length} finding(s)`} (${loginReqs.length} upstream request(s))`);
+    console.log(`parity: paste login starts a code and probes the streak: ${loginFindings.length === 0 ? "ok" : `${loginFindings.length} finding(s)`} (${loginReqs.length} upstream request(s))`);
 
     for (const scenario of SCENARIOS) {
       const start = (await stub.requests()).length;

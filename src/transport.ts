@@ -18,8 +18,10 @@ const USER_AGENTS: Record<HeaderClass, string> = {
   cli: "Freebuff-CLI/0.0.105",
 };
 
-/** The base set + Authorization + the class's user agent; `extra` rides last. */
-export function upstreamHeaders(headerClass: HeaderClass, token: string, extra: HeaderPair[] = []): HeaderPair[] {
+/** The base set + Authorization + the class's user agent; `extra` rides last.
+ * A `null` token drops the header: the CLI's login routes answer before any
+ * account exists. */
+export function upstreamHeaders(headerClass: HeaderClass, token: string | null, extra: HeaderPair[] = []): HeaderPair[] {
   const host = new URL(upstreamBase()).host;
   return [
     ["Accept", "*/*"],
@@ -27,7 +29,7 @@ export function upstreamHeaders(headerClass: HeaderClass, token: string, extra: 
     ["Connection", "keep-alive"],
     ["Host", host],
     ["User-Agent", USER_AGENTS[headerClass]],
-    ["Authorization", `Bearer ${token}`],
+    ...(token === null ? [] : ([["Authorization", `Bearer ${token}`]] as HeaderPair[])),
     ...extra,
   ];
 }
@@ -35,7 +37,7 @@ export function upstreamHeaders(headerClass: HeaderClass, token: string, extra: 
 export interface UpstreamRequest {
   path: string;
   method: "GET" | "POST" | "DELETE";
-  token: string;
+  token: string | null;
   headerClass: HeaderClass;
   /** JSON body; sent only on POST. */
   body?: unknown;
@@ -98,3 +100,5 @@ export const CHAT_PATH = "/api/v1/chat/completions";
 export const SESSION_PATH = "/api/v1/freebuff/session";
 export const AGENT_RUNS_PATH = "/api/v1/agent-runs";
 export const STREAK_PATH = "/api/v1/freebuff/streak";
+export const CLI_LOGIN_CODE_PATH = "/api/auth/cli/code";
+export const CLI_LOGIN_STATUS_PATH = "/api/auth/cli/status";

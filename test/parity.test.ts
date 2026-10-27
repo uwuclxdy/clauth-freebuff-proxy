@@ -15,8 +15,8 @@ const API_UA = "Bun/1.3.11";
 
 const CTX: CompareContext = { token: TOKEN, host: "127.0.0.1:9", instanceId: INSTANCE };
 
-function req(method: string, path: string, headers: Array<[string, string]>, bodyRaw: string | null = null): RecordedRequest {
-  return { method, path, headers, bodyRaw, at: 0 };
+function req(method: string, path: string, headers: Array<[string, string]>, bodyRaw: string | null = null, search = ""): RecordedRequest {
+  return { method, path, search, headers, bodyRaw, at: 0 };
 }
 
 function baseHeaders(userAgent: string): Array<[string, string]> {
@@ -76,6 +76,56 @@ describe("requestClass", () => {
     expect(requestClass(conformingSlice()[3]!)).toBe("run-finish");
     expect(requestClass(req("POST", "/api/v1/ads", [], "{}"))).toBeNull();
     expect(requestClass(req("POST", "/api/v1/agent-runs", [], JSON.stringify({ action: "OTHER" })))).toBeNull();
+  });
+});
+
+const LOGIN_HASH = "d".repeat(64);
+const LOGIN_QUERY = `?fingerprintId=clauth-freebuff-proxy-abc&fingerprintHash=${LOGIN_HASH}&expiresAt=1793094251375`;
+
+function unauthenticated(userAgent: string, withContentType = false): Array<[string, string]> {
+  return [
+    ...baseHeaders(userAgent).filter(([name]) => name !== "Authorization"),
+    ...(withContentType ? ([["Content-Type", "application/json"]] as Array<[string, string]>) : []),
+  ];
+}
+
+function loginSlice(query = LOGIN_QUERY): RecordedRequest[] {
+  return [
+    req("POST", "/api/auth/cli/code", unauthenticated(API_UA, true), JSON.stringify({ fingerprintId: "clauth-freebuff-proxy-abc" })),
+    req("GET", "/api/auth/cli/status", unauthenticated(API_UA), null, query),
+  ];
+}
+
+const LOGIN_PINS: ScenarioPins = { expect: ["login-code", "login-status"], sessionLive: false };
+
+describe("the login wire", () => {
+  test("the CLI's code and status requests classify without a credential and pin their shapes", () => {
+    expect(requestClass(loginSlice()[0]!)).toBe("login-code");
+    expect(requestClass(loginSlice()[1]!)).toBe("login-status");
+    expect(compareScenario("login", loginSlice(), LOGIN_PINS, CTX)).toEqual([]);
+  });
+
+  test("a login request carrying a credential reds", () => {
+    const slice = loginSlice();
+    slice[1] = { ...slice[1]!, headers: baseHeaders(API_UA) };
+    const findings = compareScenario("login", slice, LOGIN_PINS, CTX);
+    expect(findings.map((finding) => finding.detail).join("\n")).toContain("Authorization");
+  });
+
+  test("a status poll missing its fingerprint hash reds", () => {
+    const findings = compareScenario("login", loginSlice("?fingerprintId=abc&expiresAt=1"), LOGIN_PINS, CTX);
+    expect(findings.some((finding) => finding.detail.includes("fingerprintHash"))).toBe(true);
+  });
+
+  test("a status poll with an extra key, an empty value or a non-numeric expiry reds", () => {
+    const extra = compareScenario("login", loginSlice(`${LOGIN_QUERY}&extra=1`), LOGIN_PINS, CTX);
+    expect(extra.some((finding) => finding.detail.includes("key set"))).toBe(true);
+
+    const empty = compareScenario("login", loginSlice("?fingerprintId=&fingerprintHash=&expiresAt=1"), LOGIN_PINS, CTX);
+    expect(empty.some((finding) => finding.detail.includes("fingerprintId"))).toBe(true);
+
+    const badExpiry = compareScenario("login", loginSlice(LOGIN_QUERY.replace("expiresAt=1793094251375", "expiresAt=soon")), LOGIN_PINS, CTX);
+    expect(badExpiry.some((finding) => finding.detail.includes("expiresAt"))).toBe(true);
   });
 });
 

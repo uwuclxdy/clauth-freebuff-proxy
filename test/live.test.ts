@@ -9,6 +9,7 @@ import {
   captureMode,
   capped,
   readFigures,
+  redactedBody,
   redactedHeaders,
   refuseExistingCapture,
   scrubSecrets,
@@ -88,6 +89,77 @@ describe("the recording relay", () => {
     expect(responseHeaderNames).not.toContain("content-encoding");
     expect(responseHeaderNames).not.toContain("content-length");
     expect(responseHeaderNames).not.toContain("transfer-encoding");
+  });
+
+  test("a recorded login answer has its auth token redacted while the proxy gets it whole", async () => {
+    const user = { user: { authToken: TOKEN, email: "stub@example.com" } };
+    const upstream = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => Response.json(user) });
+    const records: TeeRecord[] = [];
+    let relay: ReturnType<typeof startRelay> | undefined;
+    try {
+      relay = startRelay(`http://127.0.0.1:${upstream.port}`, records);
+      const answer = await fetch(`${relay.base}/api/auth/cli/status`);
+      expect(await answer.json()).toEqual(user);
+    } finally {
+      relay?.stop();
+      upstream.stop(true);
+    }
+    expect(records).toHaveLength(2);
+    expect(records[1]?.body).toBe('{"user":{"authToken":"<redacted>","email":"stub@example.com"}}');
+    expect(JSON.stringify(records)).not.toContain(TOKEN);
+  });
+
+  test("a recorded login code answer loses its sign-in code and its fingerprint", async () => {
+    const hash = "d".repeat(64);
+    const answer = {
+      loginUrl: "https://www.codebuff.com/login?auth_code=SECRET-CODE",
+      fingerprintId: "clauth-freebuff-proxy-abc",
+      fingerprintHash: hash,
+      expiresAt: 1793094251375,
+      expiresInMs: 600000,
+    };
+    const upstream = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => Response.json(answer) });
+    const records: TeeRecord[] = [];
+    let relay: ReturnType<typeof startRelay> | undefined;
+    try {
+      relay = startRelay(`http://127.0.0.1:${upstream.port}`, records);
+      expect(await (await fetch(`${relay.base}/api/auth/cli/code`, { method: "POST", body: "{}" })).json()).toEqual(answer);
+    } finally {
+      relay?.stop();
+      upstream.stop(true);
+    }
+    const recorded = JSON.parse(records[1]!.body) as Record<string, unknown>;
+    expect(new URL(recorded["loginUrl"] as string).searchParams.get("auth_code")).toBe("<redacted>");
+    expect(recorded["fingerprintId"]).toBe("<redacted>");
+    expect(recorded["fingerprintHash"]).toBe("<redacted>");
+    expect(records[1]!.body).not.toContain("SECRET-CODE");
+    expect(records[1]!.body).not.toContain(hash);
+  });
+
+  test("a relative login URL is scrubbed in place", () => {
+    const recorded = redactedBody(JSON.stringify({ loginUrl: "/login?auth_code=SECRET-REL&next=%2Fhome" }));
+    expect(recorded).toBe('{"loginUrl":"/login?auth_code=<redacted>&next=%2Fhome"}');
+  });
+
+  test("a recorded status poll keeps its query keys and loses the hash", async () => {
+    const hash = "e".repeat(64);
+    const upstream = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => new Response(null, { status: 401 }) });
+    const records: TeeRecord[] = [];
+    let relay: ReturnType<typeof startRelay> | undefined;
+    try {
+      relay = startRelay(`http://127.0.0.1:${upstream.port}`, records);
+      await fetch(`${relay.base}/api/auth/cli/status?fingerprintId=abc&fingerprintHash=${hash}&expiresAt=1793094251375`);
+    } finally {
+      relay?.stop();
+      upstream.stop(true);
+    }
+    const [base, query] = records[0]!.path.split("?");
+    expect(base).toBe("/api/auth/cli/status");
+    const params = new URLSearchParams(query ?? "");
+    expect(params.get("fingerprintId")).toBe("abc");
+    expect(params.get("fingerprintHash")).toBe("<redacted>");
+    expect(params.get("expiresAt")).toBe("1793094251375");
+    expect(records[0]!.path).not.toContain(hash);
   });
 });
 

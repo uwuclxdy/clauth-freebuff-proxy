@@ -42,6 +42,12 @@ describe("header sets", () => {
     }
   });
 
+  test("a null token drops the Authorization header", () => {
+    const headers = upstreamHeaders("api", null);
+    expect(headers.map(([name]) => name)).not.toContain("Authorization");
+    expect(headers).toContainEqual(["User-Agent", "Bun/1.3.11"]);
+  });
+
   test("the user agent is the one difference between the classes", () => {
     expect(upstreamHeaders("api", "t").find(([name]) => name === "User-Agent")).toEqual(["User-Agent", "Bun/1.3.11"]);
     expect(upstreamHeaders("chat", "t").find(([name]) => name === "User-Agent")).toEqual([
