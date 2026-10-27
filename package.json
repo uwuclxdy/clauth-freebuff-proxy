@@ -11,7 +11,9 @@
     "bun": ">=1.3.0"
   },
   "scripts": {
-    "check": "tsc --noEmit && bun test"
+    "check": "tsc --noEmit && bun test",
+    "check:conformance": "bun scripts/conformance.ts",
+    "check:parity": "bun scripts/parity.ts"
   },
   "dependencies": {
     "clauth-proxy-core": "git+https://github.com/uwuclxdy/clauth-proxy-core.git#v0.1.0"

@@ -1,5 +1,9 @@
-# CI: install, then the typecheck+test gate. The conformance and wire-parity
-# harnesses join here once they exist (see docs/todo.md).
+# CI: install, the typecheck+test gate, then two harnesses against loopback
+# fixtures only. The conformance harness drives the real proxy process with a
+# `clauth proxy check` fetched from the public clauth release (tag + digest
+# checked in beside it, out-of-band of the release channel); the wire-parity
+# harness compares the proxy's upstream requests against the shapes the
+# protocol brief pins.
 name: ci
 on:
   push:
@@ -8,6 +12,8 @@ on:
   workflow_dispatch: {}
 permissions:
   contents: read
+env:
+  CLAUTH_RELEASE: v0.18.0
 jobs:
   check:
     runs-on: ubuntu-latest
@@ -17,5 +23,23 @@ jobs:
         with:
           bun-version: latest
       - run: bun install --frozen-lockfile
-      - run: bunx tsc --noEmit
-      - run: bun test
+      - run: bun run check
+      - name: fetch the clauth binary for the conformance harness
+        env:
+          # out-of-band of the release channel: bump with CLAUTH_RELEASE
+          CLAUTH_SHA256: 74c0b1630a2e1a93f5bffffa7a3bcbd31740306892cf21a4c969133e26e38d18
+        run: |
+          curl -fsSLO "https://github.com/uwuclxdy/clauth/releases/download/${CLAUTH_RELEASE}/clauth-linux-x86_64"
+          echo "${CLAUTH_SHA256}  clauth-linux-x86_64" | sha256sum -c -
+          chmod +x clauth-linux-x86_64
+          echo "CLAUTH_BIN=$PWD/clauth-linux-x86_64" >> "$GITHUB_ENV"
+      - run: bun run check:conformance
+  parity:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - run: bun install --frozen-lockfile
+      - run: bun run check:parity
