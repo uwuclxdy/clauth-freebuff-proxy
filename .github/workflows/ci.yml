@@ -4,6 +4,10 @@
 # checked in beside it, out-of-band of the release channel); the wire-parity
 # harness compares the proxy's upstream requests against the shapes the
 # protocol brief pins.
+#
+# Coverage rides a second job: the check job runs the suite instrumented
+# (lcov) and uploads it; only the coverage job holds `contents: write`, so the
+# token that posts to the `coverage` branch never meets build or test code.
 name: ci
 on:
   push:
@@ -23,7 +27,16 @@ jobs:
         with:
           bun-version: latest
       - run: bun install --frozen-lockfile
-      - run: bun run check
+      - run: bun run tsc --noEmit
+      - name: test (coverage)
+        run: bun test --coverage --coverage-reporter=lcov
+      - name: upload the lcov report
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: coverage-lcov
+          path: coverage/lcov.info
+          if-no-files-found: error
+          retention-days: 7
       - name: fetch the clauth binary for the conformance harness
         env:
           # out-of-band of the release channel: bump with CLAUTH_RELEASE
@@ -43,3 +56,32 @@ jobs:
           bun-version: latest
       - run: bun install --frozen-lockfile
       - run: bun run check:parity
+  coverage:
+    needs: check
+    # a cancelled run posts nothing; a red check after the upload still reports
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      actions: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: coverage-lcov
+          path: coverage
+      - name: coverage report
+        env:
+          # out-of-band of the release channel: bump with BIN_VERSION
+          BIN_VERSION: v0.79.0
+          TARBALL_SHA256: e38214079faf1f39d8ba625f4f31b0fb253fffa537d6db21a0e8b64938e3adc5
+          OCTOCOV_GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          find coverage -type f
+          curl -fsSLo octocov.tar.gz "https://github.com/k1LoW/octocov/releases/download/${BIN_VERSION}/octocov_${BIN_VERSION}_linux_amd64.tar.gz"
+          echo "${TARBALL_SHA256}  octocov.tar.gz" | sha256sum -c -
+          tar -xzf octocov.tar.gz octocov
+          ./octocov

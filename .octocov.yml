@@ -3,6 +3,8 @@ coverage:
   paths:
     - coverage/lcov.info
   exclude:
+    - "test/**"
+    - "scripts/**"
     - "node_modules/**"
   acceptable: patch >= 70%
   if: true
