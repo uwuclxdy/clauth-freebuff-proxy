@@ -1,6 +1,6 @@
 # clauth-freebuff-proxy
 
-**Spend freebuff's free tier from Claude Code: eight models, each account on its own pasted token.**
+**Spend freebuff's free tier from Claude Code: eight models, each account on its own browser login.**
 
 A clauth proxy built on `clauth-proxy-core`. It runs headless: clauth enables it, supervises it and holds its log.
 
@@ -42,7 +42,7 @@ Training flags are informational: a training model is served like any other. Set
 
 | stage | what happens |
 |---|---|
-| login | the account's freebuff auth token is pasted; a GET on the streak route validates it, with no side effect upstream |
+| login | the proxy runs the freebuff CLI's own login: a fingerprint-keyed code, the upstream login URL, and a status poll until the account's auth token arrives; a GET on the streak route validates it, with no side effect upstream |
 | session | one `POST /api/v1/freebuff/session` per account and model, cached until its expiry, polled while the upstream queues it; a 404 means the upstream runs sessionless and the chat proceeds without one |
 | run | an agent run `START`s per chat and `FINISH`es once the answer is fully sent (on a stream, after the last byte) |
 | chat | the converted body carries `codebuff_metadata` (`run_id`, `client_id`, `trace_session_id`, `cost_mode: "free"`, and `freebuff_instance_id` when a session exists) and `provider.data_collection: "deny"` |
@@ -79,19 +79,23 @@ freebuff  0.0.0    1.0       false       -  not_registered
 
 ### Add an account
 
-Login is paste-only. The token is freebuff's bare auth token, and the CLI's own login hands it out: run `npm install -g freebuff` and then `freebuff` once in an empty directory, finish the browser login it opens, and read `data.default.authToken` out of `~/.config/manicode/credentials.json`. The browser helper at <https://freebuff.llm.pm> serves the same token after a GitHub sign-in, but Cloudflare showed that host a phishing warning on 2026-10-27, so the CLI is the safer door. Then paste the token through the proxy's control API:
+The login is the freebuff CLI's own browser flow, driven by the proxy, so nothing needs installing: start a flow, open the URL it returns, and sign in with GitHub. The proxy polls the upstream login status, completes once the account's auth token arrives, and mints the account's inference key:
 
 ```sh
 PORT=$(clauth proxy list --json | jq -r '.[] | select(.service == "freebuff") | .port')
 ADMIN=$(cat ~/.clauth/proxies/freebuff/clauth-admin-token)
-FLOW=$(curl -sS -X POST "http://127.0.0.1:$PORT/clauth/v1/accounts/login" \
-  -H "Authorization: Bearer $ADMIN" | jq -r .flow)
-curl -sS -X POST "http://127.0.0.1:$PORT/clauth/v1/accounts/login/$FLOW" \
-  -H "Authorization: Bearer $ADMIN" -H 'content-type: application/json' \
-  -d '{"code":"<auth-token>"}' | jq '{state, label: .account.label, inference_key}'
+LOGIN=$(curl -sS -X POST "http://127.0.0.1:$PORT/clauth/v1/accounts/login" -H "Authorization: Bearer $ADMIN")
+FLOW=$(echo "$LOGIN" | jq -r .flow)
+echo "$LOGIN" | jq -r .url      # open this URL in a browser, then sign in with GitHub
+while :; do
+  STATUS=$(curl -sS "http://127.0.0.1:$PORT/clauth/v1/accounts/login/$FLOW" -H "Authorization: Bearer $ADMIN")
+  [ "$(echo "$STATUS" | jq -r .state)" = "pending" ] || break
+  sleep 5
+done
+echo "$STATUS" | jq '{state, label: .account.label, inference_key}'
 ```
 
-The paste answers `state: "done"` with the account and its inference key. The key is shown once; the proxy stores only its hash. Point Claude Code at the proxy with that key:
+The done answer carries the account and its inference key. The key is shown once; the proxy stores only its hash. An existing auth token can be pasted into the same flow instead (`POST /clauth/v1/accounts/login/{flow}` with `{"code": "<auth-token>"}`), which validates it against the upstream streak route before completing. Point Claude Code at the proxy with the key:
 
 ```sh
 export ANTHROPIC_BASE_URL="http://127.0.0.1:$PORT"
@@ -122,7 +126,7 @@ clauth supplies the first three. One account setting is declared, one action, tw
 
 ## What it leaves out
 
-- No browser login, no poll door: the token is pasted.
+- No freebuff CLI and no browser helper to install: the proxy speaks the login endpoints itself, and a pasted token still works.
 - No ads, streak reporting, agent validation or WARP: the upstream requires none of them for chat.
 - No quota of its own: the session figure reads the upstream session, and no other number is invented.
 - No UI of its own: the proxy serves the contract and nothing else.
@@ -139,7 +143,7 @@ The two other freebuff implementations this proxy was measured against put a dif
 
 ## FAQ
 
-**How do I use freebuff's free models with Claude Code?** Put `clauth-freebuff-proxy` on `PATH`, run `clauth proxy enable freebuff`, paste a freebuff auth token through its account login, and point Claude Code at the proxy's loopback port with the inference key.
+**How do I use freebuff's free models with Claude Code?** Put `clauth-freebuff-proxy` on `PATH`, run `clauth proxy enable freebuff`, log an account in through its browser login, and point Claude Code at the proxy's loopback port with the inference key.
 
 **Does clauth-freebuff-proxy need the freebuff CLI installed?** No. The proxy speaks the CLI's wire itself; only the account's auth token is needed.
 
