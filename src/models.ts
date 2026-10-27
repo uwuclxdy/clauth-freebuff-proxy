@@ -40,11 +40,20 @@ export const MODEL_ALIASES: Readonly<Record<string, string>> = {
   "gemini-3.1-flash-lite": "google/gemini-3.1-flash-lite-preview",
 };
 
+/**
+ * The client-side id `clauth proxy check` sends on its inference leg (a model
+ * Claude Code itself sends), mapped onto the free, non-training default; the
+ * chat body still dials the canonical id.
+ */
+export const CONTRACT_ALIASES: Readonly<Record<string, string>> = {
+  "claude-haiku-4-5": "minimax/minimax-m2.7",
+};
+
 /** Resolve a canonical id or a shortcut alias, or null when neither. */
 export function resolveModel(id: string): FreebuffModel | null {
   const direct = MODELS.find((model) => model.id === id);
   if (direct !== undefined) return direct;
-  const alias = MODEL_ALIASES[id];
+  const alias = MODEL_ALIASES[id] ?? CONTRACT_ALIASES[id];
   if (alias === undefined) return null;
   return MODELS.find((model) => model.id === alias) ?? null;
 }

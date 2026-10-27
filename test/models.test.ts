@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { MODELS, MODEL_ALIASES, resolveModel } from "../src/models.ts";
+import { CONTRACT_ALIASES, MODELS, MODEL_ALIASES, resolveModel } from "../src/models.ts";
 
 // The table is pinned verbatim from the node README's "Available Models" table
 // (2026-10-26 cache), the alias list from its "Shortcuts" section.
@@ -32,6 +32,13 @@ describe("model table", () => {
     });
     expect(resolveModel("deepseek-v3.1-terminus")?.id).toBe("deepseek/deepseek-v4-pro");
     expect(resolveModel("gemini-3.1-flash-lite")?.id).toBe("google/gemini-3.1-flash-lite-preview");
+  });
+
+  // clauth proxy check's inference leg sends claude-haiku-4-5 and demands a
+  // 200 message answer of any proxy that serves Claude Code.
+  test("the contract's haiku id rides the default free model", () => {
+    expect(CONTRACT_ALIASES).toEqual({ "claude-haiku-4-5": "minimax/minimax-m2.7" });
+    expect(resolveModel("claude-haiku-4-5")?.id).toBe("minimax/minimax-m2.7");
   });
 
   test("canonical ids resolve directly; anything else is not a model", () => {
