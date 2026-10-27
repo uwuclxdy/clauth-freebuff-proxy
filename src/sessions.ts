@@ -32,7 +32,7 @@ export interface SessionEntry {
 
 interface AccountUpstream {
   sessionsByModel: Map<string, SessionEntry>;
-  lastChatStartedAt: number;
+  lastChatDialAt: number;
 }
 
 const accounts = new Map<string, AccountUpstream>();
@@ -40,7 +40,7 @@ const accounts = new Map<string, AccountUpstream>();
 function accountState(accountId: string): AccountUpstream {
   let entry = accounts.get(accountId);
   if (entry === undefined) {
-    entry = { sessionsByModel: new Map(), lastChatStartedAt: 0 };
+    entry = { sessionsByModel: new Map(), lastChatDialAt: 0 };
     accounts.set(accountId, entry);
   }
   return entry;
@@ -55,7 +55,7 @@ export function requestGapMs(settings: Record<string, unknown>): number {
 
 export function dropAccount(accountId: string): void {
   accounts.delete(accountId);
-  gapLocks.delete(accountId);
+  dialGates.delete(accountId);
 }
 
 /** Any live session's instance id, for the account-scoped session GET. */
@@ -376,7 +376,8 @@ function isRunIdError(status: number, body: unknown): boolean {
   return message.includes("runid not found") || message.includes("runid not running");
 }
 
-async function postChat(accountId: string, token: string, body: Record<string, unknown>): Promise<Response> {
+async function postChat(accountId: string, token: string, body: Record<string, unknown>, gapMs: number): Promise<Response> {
+  await dialGate(accountId, gapMs);
   return countedSend(accountId, {
     path: CHAT_PATH,
     method: "POST",
@@ -402,22 +403,21 @@ export interface ChatAttempt {
 }
 
 /**
- * One chat on the account's behalf: the request-gap debounce (serialized per
- * account), the session (sessionless tolerated), a fresh agent run, the POST,
- * and one bounded retry per error class — a dead run
+ * One chat on the account's behalf: the session (sessionless tolerated), a
+ * fresh agent run, the POST behind the account's dial gate, and one bounded
+ * retry per error class — a dead run
  * (`runid not found`/`runid not running`), an invalidated session
  * (426/`freebuff_update_required`), and a `session_model_mismatch`.
  */
 export async function runChat(plan: ChatPlan): Promise<ChatAttempt> {
   const { accountId, token, model, body: converted, gapMs } = plan;
-  await waitOutRequestGap(accountId, gapMs);
   const modelEntry = resolveModel(model);
   if (modelEntry === null) throw new AdapterError("upstream_unavailable", `chat: unknown model ${JSON.stringify(model)}`);
   const canonical = modelEntry.id;
 
   let session = await ensureSession(accountId, token, canonical);
   let runId = await startRun(accountId, token, modelEntry.agentId);
-  let response = await postChat(accountId, token, assembleChatBody({ ...converted, model: canonical }, runId, session));
+  let response = await postChat(accountId, token, assembleChatBody({ ...converted, model: canonical }, runId, session), gapMs);
 
   let retriedRun = false;
   let retriedInvalidation = false;
@@ -428,13 +428,13 @@ export async function runChat(plan: ChatPlan): Promise<ChatAttempt> {
     if (!retriedRun && isRunIdError(response.status, errorBody)) {
       retriedRun = true;
       runId = await startRun(accountId, token, modelEntry.agentId);
-      response = await postChat(accountId, token, assembleChatBody({ ...converted, model: canonical }, runId, session));
+      response = await postChat(accountId, token, assembleChatBody({ ...converted, model: canonical }, runId, session), gapMs);
     } else if (!retriedInvalidation && sessionInvalid(response.status, readSessionBody(errorBody))) {
       retriedInvalidation = true;
       await invalidateAccountSession(accountId, token);
       session = await ensureSession(accountId, token, canonical);
       runId = await startRun(accountId, token, modelEntry.agentId);
-      response = await postChat(accountId, token, assembleChatBody({ ...converted, model: canonical }, runId, session));
+      response = await postChat(accountId, token, assembleChatBody({ ...converted, model: canonical }, runId, session), gapMs);
     } else if (isSessionModelMismatch(response.status, errorBody)) {
       if (retriedModelMismatch) {
         throw new AdapterError(
@@ -446,7 +446,7 @@ export async function runChat(plan: ChatPlan): Promise<ChatAttempt> {
       await invalidateAccountSession(accountId, token);
       session = await ensureSession(accountId, token, canonical);
       runId = await startRun(accountId, token, modelEntry.agentId);
-      response = await postChat(accountId, token, assembleChatBody({ ...converted, model: canonical }, runId, session));
+      response = await postChat(accountId, token, assembleChatBody({ ...converted, model: canonical }, runId, session), gapMs);
     } else {
       response = rebuildJsonResponse(response, errorBody);
       break;
@@ -460,26 +460,30 @@ export async function runChat(plan: ChatPlan): Promise<ChatAttempt> {
   return { response, finish: () => finishRun(accountId, token, runId) };
 }
 
-const gapLocks = new Map<string, Promise<void>>();
+const dialGates = new Map<string, Promise<void>>();
 
 /**
- * The request-gap wait, serialized per account through a promise-chain lock:
- * two concurrent chats must not both read the same `lastChatStartedAt`, or
- * both would dial inside the gap the freebuff client itself keeps.
+ * The dial gate, serialized per account through a promise-chain lock: the
+ * chat POST dispatches only once the account's previous chat POST is `gapMs`
+ * old, read off the shared last-dial timestamp under the gate. Only the
+ * dispatch sits inside the gate — session and run setup never hold it, so a
+ * queued session's poll cannot delay another chat's dial, and two concurrent
+ * chats cannot both read the same last-dial time and dial inside the gap the
+ * freebuff client itself keeps.
  */
-async function waitOutRequestGap(accountId: string, gapMs: number): Promise<void> {
-  const previous = gapLocks.get(accountId) ?? Promise.resolve();
+async function dialGate(accountId: string, gapMs: number): Promise<void> {
+  const previous = dialGates.get(accountId) ?? Promise.resolve();
   let release!: () => void;
   const held = new Promise<void>((resolve) => {
     release = resolve;
   });
-  gapLocks.set(accountId, previous.then(() => held));
+  dialGates.set(accountId, previous.then(() => held));
   await previous;
   try {
     const account = accountState(accountId);
-    const wait = account.lastChatStartedAt + gapMs - Date.now();
+    const wait = account.lastChatDialAt + gapMs - Date.now();
     if (wait > 0) await Bun.sleep(wait);
-    account.lastChatStartedAt = Date.now();
+    account.lastChatDialAt = Date.now();
   } finally {
     release();
   }

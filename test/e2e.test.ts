@@ -1,6 +1,7 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { rmSync } from "node:fs";
 import { join } from "node:path";
+import { expectMetadataShape } from "./metadata-shape.ts";
 
 const REPO = join(import.meta.dir, "..");
 const ADMIN_TOKEN = "0".repeat(64);
@@ -269,8 +270,7 @@ describe("freebuff proxy e2e", () => {
       { type: "function", function: { name: "get_weather", description: "get weather", parameters: { type: "object", properties: { city: { type: "string" } } } } },
     ]);
     expect(chatBody.codebuff_metadata.cost_mode).toBe("free");
-    expect(chatBody.codebuff_metadata.freebuff_instance_id).toBe("inst-1");
-    expect(chatBody.codebuff_metadata.run_id).toBe("run-1");
+    expectMetadataShape(chatBody.codebuff_metadata, "run-1", "inst-1");
     expect(chatBody.provider).toEqual({ data_collection: "deny" });
     expect(chat.userAgent).toContain("ai-sdk/openai-compatible");
   });

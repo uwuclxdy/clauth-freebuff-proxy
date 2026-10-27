@@ -1,5 +1,6 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { assembleChatBody, ensureSession, runChat } from "../src/sessions.ts";
+import { expectMetadataShape } from "./metadata-shape.ts";
 
 // The session/run error paths, driven against one configurable loopback stub. Every
 // test uses its own account id so the module's per-account session map never
@@ -19,7 +20,7 @@ interface StubRoutes {
   createSession?: () => Response;
   getSession?: (instanceId: string | null) => Response;
   deleteSession?: () => Response;
-  agentRun?: (body: any) => Response;
+  agentRun?: (body: any) => Response | Promise<Response>;
   chat?: (body: any) => Response;
 }
 
@@ -32,18 +33,6 @@ const ACTIVE_SESSION = {
   remainingMs: 3_600_000,
   model: MODEL,
 };
-const UUID_SHAPE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
-
-function expectMetadataShape(meta: Record<string, unknown>, runId: string, instanceId: string | null): void {
-  const expectedKeys = ["client_id", "cost_mode", "run_id", "trace_session_id"];
-  if (instanceId !== null) expectedKeys.push("freebuff_instance_id");
-  expect(Object.keys(meta).sort()).toEqual(expectedKeys.sort());
-  expect(meta.run_id).toBe(runId);
-  expect(meta.cost_mode).toBe("free");
-  expect(meta.client_id).toMatch(/^[0-9a-z]{13}$/);
-  expect(meta.trace_session_id).toMatch(UUID_SHAPE);
-  if (instanceId !== null) expect(meta.freebuff_instance_id).toBe(instanceId);
-}
 
 describe("sessions and runs", () => {
   let recorded: RecordedRequest[] = [];
@@ -70,7 +59,7 @@ describe("sessions and runs", () => {
           if (req.method === "GET") return routes.getSession?.(req.headers.get("x-freebuff-instance-id")) ?? Response.json(ACTIVE_SESSION);
           if (req.method === "DELETE") return routes.deleteSession?.() ?? new Response(null, { status: 204 });
         }
-        if (url.pathname === "/api/v1/agent-runs" && req.method === "POST") return routes.agentRun?.(body) ?? Response.json({ runId: "run-1" });
+        if (url.pathname === "/api/v1/agent-runs" && req.method === "POST") return await (routes.agentRun?.(body) ?? Response.json({ runId: "run-1" }));
         if (url.pathname === "/api/v1/chat/completions" && req.method === "POST") return routes.chat?.(body) ?? Response.json({ ok: true });
         return new Response("stub: not found", { status: 404 });
       },
@@ -305,6 +294,54 @@ describe("sessions and runs", () => {
     expect(attempt.response.headers.get("transfer-encoding")).toBeNull();
   });
 
+  test("two concurrent cold chats land their POSTs ≥ gap apart even when the first builds a session", async () => {
+    recorded = [];
+    let starts = 0;
+    routes = {
+      // the first chat's run START lags 600 ms: its session caches long before
+      // its dial, so the second chat rides the cache and its POST lands while
+      // the first is still between setup and dial
+      agentRun: (body) => {
+        starts += 1;
+        if (body.action === "START" && starts === 1) {
+          return new Promise((resolve) => setTimeout(() => resolve(Response.json({ runId: "run-1" })), 600));
+        }
+        return Response.json({ runId: "run-1" });
+      },
+    };
+    const first = chatOnce("acct-gap-cold", 150);
+    await Bun.sleep(500);
+    const second = chatOnce("acct-gap-cold", 150);
+    await Promise.all([first, second]);
+    const chats = recorded.filter((r) => r.path === "/api/v1/chat/completions");
+    expect(chats.length).toBe(2);
+    expect(Math.abs(chats[0]!.at - chats[1]!.at)).toBeGreaterThanOrEqual(140);
+  });
+
+  test("a queued session's poll never holds the dial gate", async () => {
+    recorded = [];
+    let firstCreate = true;
+    routes = {
+      createSession: () => {
+        if (firstCreate) {
+          firstCreate = false;
+          return Response.json({ ...ACTIVE_SESSION, status: "queued", estimatedWaitMs: 1200 });
+        }
+        return Response.json(ACTIVE_SESSION);
+      },
+    };
+    const started = Date.now();
+    const first = chatOnce("acct-gap-queued", 150);
+    await Bun.sleep(50);
+    const second = chatOnce("acct-gap-queued", 150);
+    await Promise.all([first, second]);
+    const chats = recorded.filter((r) => r.path === "/api/v1/chat/completions");
+    expect(chats.length).toBe(2);
+    // the first chat cannot dial before its ~1200 ms poll settles, so an early
+    // POST is the second chat's: the poll never blocked it
+    expect(chats[0]!.at).toBeLessThan(started + 1200);
+  });
+
   test("FINISH closes the run with the completed shape", async () => {
     recorded = [];
     routes = {};
@@ -346,10 +383,10 @@ describe("chat body assembly", () => {
     const session = { instanceId: "inst-9", model: "m", expiresAtEpoch: Number.MAX_SAFE_INTEGER };
     const withStop = assembleChatBody({ model: "m", stop: ["END"] }, "run-1", session);
     expect(withStop.stop).toEqual(["END"]);
-    expect(withStop.codebuff_metadata).toMatchObject({ run_id: "run-1", freebuff_instance_id: "inst-9", cost_mode: "free" });
+    expectMetadataShape(withStop.codebuff_metadata as Record<string, unknown>, "run-1", "inst-9");
     const sessionless = assembleChatBody({ model: "m" }, "run-2", null);
     expect(sessionless.stop).toEqual(["cb_easp"]);
-    expect("freebuff_instance_id" in (sessionless.codebuff_metadata as Record<string, unknown>)).toBe(false);
+    expectMetadataShape(sessionless.codebuff_metadata as Record<string, unknown>, "run-2", null);
     expect(sessionless.provider).toEqual({ data_collection: "deny" });
   });
 });
