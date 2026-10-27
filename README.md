@@ -79,7 +79,7 @@ freebuff  0.0.0    1.0       false       -  not_registered
 
 ### Add an account
 
-Login is paste-only. Sign in at <https://freebuff.llm.pm> once with GitHub and copy the auth token the page hands you; the freebuff CLI's own `~/.config/manicode/credentials.json` carries the same token under `data.default.authToken`. Then paste it through the proxy's control API:
+Login is paste-only. The token is freebuff's bare auth token, and the CLI's own login hands it out: run `npm install -g freebuff` and then `freebuff` once in an empty directory, finish the browser login it opens, and read `data.default.authToken` out of `~/.config/manicode/credentials.json`. The browser helper at <https://freebuff.llm.pm> serves the same token after a GitHub sign-in, but Cloudflare showed that host a phishing warning on 2026-10-27, so the CLI is the safer door. Then paste the token through the proxy's control API:
 
 ```sh
 PORT=$(clauth proxy list --json | jq -r '.[] | select(.service == "freebuff") | .port')
