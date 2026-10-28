@@ -40,10 +40,10 @@ A client's own system prompt follows it; when the client sends none, the opening
 | stage | what happens |
 |---|---|
 | login | the proxy runs the freebuff CLI's own login: a fingerprint-keyed code, the upstream login URL, and a status poll until the account's auth token arrives; a GET on the streak route validates it, with no side effect upstream |
-| session | chats run sessionless like the CLI; the upstream binds its session to the model on the first chat, and the `session` figure reads `GET /api/v1/freebuff/session` |
+| session | a chat with no live session answers `428 waiting_room_required`; the proxy posts the free-session admission once with the row's `handle`, then retries the chat — the upstream binds the session to the model, and the `session` figure reads `GET /api/v1/freebuff/session` |
 | run | an agent run `START`s per chat and `FINISH`es once the answer is fully sent (on a stream, after the last byte) |
 | chat | the converted body selects the catalogue row's `handle` and carries the CLI's `codebuff_metadata` (`run_id`, `client_id`, `trace_session_id`, `cost_mode: "free"`, `freebuff_instance_id` as the proxy's local `cli:` id, the multi-session and `surface: "cli"` markers, and the client-env fields) plus `provider.data_collection: "deny"` |
-| retries | one retry per error class: a dead run id, a stale catalogue, a session bound to another model (its session ends once, then the chat retries) |
+| retries | one retry per error class: a dead run id, a stale catalogue, a session bound to another model (its session ends once, then the chat retries), and the waiting room (one session admission, then the chat retries) |
 | pacing | the account's chat requests are at least `request_gap_ms` apart, the gap the freebuff client itself keeps |
 
 ## Install
