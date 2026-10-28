@@ -116,7 +116,7 @@ clauth supplies the first three. One account setting is declared, one action, tw
 |---|---|---|
 | setting | `request_gap_ms` | minimum milliseconds between the account's chat requests; default `1300`, range 0 to 60000, step 100 |
 | action | `end-session` | ends every upstream session the account holds and forgets them; asks for confirmation |
-| figure | `session` | percent of the current one-hour upstream session used and when it resets; absent with no active session |
+| figure | `session` | the daily free-session pool the upstream reports for the model the account's last chat used: sessions used of the daily limit and when the pool resets; absent before any chat |
 | figure | `stats` | the proxy's own request counters for the process lifetime (attempted, succeeded, failed, cancelled, mean latency, tokens), so a restart restarts them |
 
 `count_tokens` answers locally as `ceil(chars / 4)` over the request's text parts, system and tool results included, with no upstream call.
