@@ -55,6 +55,14 @@ describe("the model catalogue", () => {
     expect(parseCatalogue(null)).toBeNull();
   });
 
+  test("a catalogue's fetchId is a non-empty string or null", () => {
+    expect(parseCatalogue(CATALOGUE_RAW)!.fetchId).toBe("fbf1.test");
+    const rows = CATALOGUE_RAW.rows;
+    expect(parseCatalogue({ version: "v1", rows })!.fetchId).toBeNull();
+    expect(parseCatalogue({ version: "v1", fetchId: "", rows })!.fetchId).toBeNull();
+    expect(parseCatalogue({ version: "v1", fetchId: 7, rows })!.fetchId).toBeNull();
+  });
+
   test("slugs collapse every non-alphanumeric run", () => {
     expect(slugOf("Claude Haiku 5.5 · 100k context")).toBe("claude-haiku-5-5-100k-context");
     expect(slugOf("  GPT-6.1 Sol Pro  ")).toBe("gpt-6-1-sol-pro");

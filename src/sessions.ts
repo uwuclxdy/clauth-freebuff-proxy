@@ -14,8 +14,10 @@ import { ConvertError } from "./convert.ts";
 import { parseCatalogue, resolveRow, type Catalogue } from "./models.ts";
 import { recordUpstream } from "./stats.ts";
 import {
+  ADMISSION_PATH,
   AGENT_RUNS_PATH,
   CHAT_PATH,
+  CLI_VERSION,
   MODELS_PATH,
   SESSION_PATH,
   retryAfterSeconds,
@@ -160,6 +162,31 @@ export async function endAccountSessions(accountId: string, token: string): Prom
   await endSession(accountId, token, instanceIdOf(accountId));
 }
 
+/** Start the account's free session through the admission door; a non-2xx answer is upstream trouble. */
+async function admitSession(accountId: string, token: string, handle: string, fetchId: string | null): Promise<void> {
+  const instanceId = instanceIdOf(accountId);
+  const extra: HeaderPair[] = [
+    ["x-freebuff-client", "cli"],
+    ["x-freebuff-client-version", CLI_VERSION],
+    ["x-freebuff-multi-session", "1"],
+    ["x-freebuff-purchase-continuity", "1"],
+    ["x-freebuff-desktop-attempt-id", instanceId.replace(/^cli:/, "")],
+    ["x-freebuff-instance-id", instanceId],
+    ["x-freebuff-model", handle],
+    ["x-freebuff-wallet-spend-limit", "session"],
+    ["x-freebuff-catalog-protocol", CATALOG_PROTOCOL],
+  ];
+  if (fetchId !== null) extra.push(["x-freebuff-catalog-fetch", fetchId]);
+  const { status, retryAfter } = await countedJson(accountId, {
+    path: ADMISSION_PATH,
+    method: "POST",
+    token,
+    headerClass: "cli",
+    extraHeaders: extra,
+  });
+  if (status < 200 || status >= 300) throw upstreamFailure("session admission", status, retryAfter);
+}
+
 // ---- the run chain ----------------------------------------------------------
 
 export async function startRun(accountId: string, token: string): Promise<string> {
@@ -229,8 +256,13 @@ function isCatalogStale(status: number, body: unknown): boolean {
 }
 
 function isSessionModelMismatch(status: number, body: unknown): boolean {
-  if (status < 400 || status >= 500) return false;
+  if (status < 400 || status >= 500 || status === 428) return false;
   return JSON.stringify(body ?? "").includes("session_model_mismatch");
+}
+
+function isWaitingRoomRequired(status: number, body: unknown): boolean {
+  if (status !== 428) return false;
+  return JSON.stringify(body ?? "").includes("waiting_room_required");
 }
 
 /** The bound model a `session_model_mismatch` names. */
@@ -265,6 +297,8 @@ export interface ChatPlan {
   model: string;
   /** The row's signed handle; the chat body's `model` field carries it. */
   handle: string;
+  /** The catalogue's fetchId, carried by a session admission when non-null. */
+  fetchId: string | null;
   body: Record<string, unknown>;
   gapMs: number;
 }
@@ -279,18 +313,21 @@ export interface ChatAttempt {
  * One sessionless chat on the account's behalf: a fresh agent run, the POST
  * behind the account's dial gate, and one bounded retry per error class — a
  * dead run (`runid not found`/`runid not running`), a stale catalogue
- * (`freebuff_catalog_stale`, one refetch), and a `session_model_mismatch`
- * (the server session ends once).
+ * (`freebuff_catalog_stale`, one refetch), a `session_model_mismatch`
+ * (the server session ends once), and a waiting room
+ * (`waiting_room_required`, one session admission).
  */
 export async function runChat(plan: ChatPlan): Promise<ChatAttempt> {
   const { accountId, token, model, body: converted, gapMs } = plan;
   let handle = plan.handle;
+  let fetchId = plan.fetchId;
   let runId = await startRun(accountId, token);
   let response = await postChat(accountId, token, assembleChatBody({ ...converted, model: handle }, runId, instanceIdOf(accountId), clientIdOf(accountId)), gapMs);
 
   let retriedRun = false;
   let retriedCatalog = false;
   let retriedMismatch = false;
+  let retriedAdmission = false;
   for (;;) {
     if (response.status < 400) break;
     const errorBody = await readErrorBody(response);
@@ -304,9 +341,11 @@ export async function runChat(plan: ChatPlan): Promise<ChatAttempt> {
       }
       retriedCatalog = true;
       dropCatalogue(accountId);
-      const fresh = resolveRow(await catalogueOf(accountId, token), model);
+      const catalogue = await catalogueOf(accountId, token);
+      const fresh = resolveRow(catalogue, model);
       if (fresh === null) throw new ConvertError(`unknown model ${JSON.stringify(model)}`);
       handle = fresh.handle;
+      fetchId = catalogue.fetchId;
       runId = await startRun(accountId, token);
       response = await postChat(accountId, token, assembleChatBody({ ...converted, model: handle }, runId, instanceIdOf(accountId), clientIdOf(accountId)), gapMs);
     } else if (isSessionModelMismatch(response.status, errorBody)) {
@@ -319,6 +358,13 @@ export async function runChat(plan: ChatPlan): Promise<ChatAttempt> {
       retriedMismatch = true;
       await endSession(accountId, token, instanceIdOf(accountId));
       runId = await startRun(accountId, token);
+      response = await postChat(accountId, token, assembleChatBody({ ...converted, model: handle }, runId, instanceIdOf(accountId), clientIdOf(accountId)), gapMs);
+    } else if (isWaitingRoomRequired(response.status, errorBody)) {
+      if (retriedAdmission) {
+        throw new AdapterError("upstream_unavailable", "chat: the admitted session still answers waiting_room_required");
+      }
+      retriedAdmission = true;
+      await admitSession(accountId, token, handle, fetchId);
       response = await postChat(accountId, token, assembleChatBody({ ...converted, model: handle }, runId, instanceIdOf(accountId), clientIdOf(accountId)), gapMs);
     } else {
       response = rebuildJsonResponse(response, errorBody);

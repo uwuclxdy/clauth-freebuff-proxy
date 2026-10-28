@@ -54,6 +54,7 @@ async function forwardMessages(ctx: ForwardContext, token: string): Promise<Resp
       token,
       model: row.key,
       handle: row.handle,
+      fetchId: catalogue.fetchId,
       // the chat body dials the row's signed handle, never the client's id
       body: toOpenAiBody({ ...parsed, model: row.handle }),
       gapMs: requestGapMs(ctx.account.settings),

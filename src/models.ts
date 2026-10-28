@@ -23,6 +23,8 @@ export interface CatalogueRow {
 
 export interface Catalogue {
   version: string;
+  /** The catalogue's fetchId, carried by a session admission when the upstream sent one. */
+  fetchId: string | null;
   rows: CatalogueRow[];
 }
 
@@ -67,7 +69,12 @@ export function parseCatalogue(body: unknown): Catalogue | null {
     });
   }
   if (rows.length === 0) return null;
-  return { version: typeof raw["version"] === "string" ? raw["version"] : "", rows };
+  const fetchId = typeof raw["fetchId"] === "string" && raw["fetchId"] !== "" ? raw["fetchId"] : null;
+  return {
+    version: typeof raw["version"] === "string" ? raw["version"] : "",
+    fetchId,
+    rows,
+  };
 }
 
 /** The first open, non-premium row; the catalogue's default answer. */

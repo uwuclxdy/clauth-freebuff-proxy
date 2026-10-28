@@ -21,6 +21,7 @@ type RecordedRequest = {
   userAgent: string | null;
   instanceHeader: string | null;
   modelHeader: string | null;
+  fetchHeader: string | null;
   body: unknown;
 };
 
@@ -30,6 +31,9 @@ function openaiChunk(delta: unknown, finishReason: string | null, model: string,
 
 /** What the stub's login status answers once the browser side has signed in. */
 let loginUserToken: string | null = null;
+
+/** Answer the next chat with the waiting-room 428, then answer normally again. */
+let failNextChat = false;
 
 function makeStubUpstream(recorded: RecordedRequest[]): { port: number; stop: () => void } {
   const server = Bun.serve({
@@ -44,13 +48,17 @@ function makeStubUpstream(recorded: RecordedRequest[]): { port: number; stop: ()
         userAgent: req.headers.get("user-agent"),
         instanceHeader: req.headers.get("x-freebuff-instance-id"),
         modelHeader: req.headers.get("x-freebuff-model"),
-        body: body === null ? null : JSON.parse(body),
+        fetchHeader: req.headers.get("x-freebuff-catalog-fetch"),
+        body: body === null || body === "" ? null : JSON.parse(body),
       });
       if (req.method === "GET" && url.pathname === "/api/v1/freebuff/streak") {
         return Response.json({ streakDays: 3 });
       }
       if (req.method === "GET" && url.pathname === "/api/v1/freebuff/models") {
-        return Response.json({ protocol: 1, version: "v0.e2e.1", rows: CATALOGUE_ROWS });
+        return Response.json({ protocol: 1, version: "v0.e2e.1", fetchId: "fbf1.e2e", rows: CATALOGUE_ROWS });
+      }
+      if (req.method === "POST" && url.pathname === "/api/v1/freebuff/session/admission") {
+        return Response.json({ status: "active", model: CHAT_KEY });
       }
       if (req.method === "POST" && url.pathname === "/api/auth/cli/code") {
         return Response.json({
@@ -86,6 +94,13 @@ function makeStubUpstream(recorded: RecordedRequest[]): { port: number; stop: ()
         if (req.method === "DELETE") return new Response(null, { status: 204 });
       }
       if (req.method === "POST" && url.pathname === "/api/v1/chat/completions") {
+        if (failNextChat) {
+          failNextChat = false;
+          return Response.json(
+            { error: "waiting_room_required", message: "Your free session has ended. Send your message again to start a new one." },
+            { status: 428 },
+          );
+        }
         const parsed = JSON.parse(body!);
         const selected = CATALOGUE_ROWS.find((row) => row.handle === parsed.model);
         const model = selected?.key ?? CHAT_KEY;
@@ -343,6 +358,36 @@ describe("freebuff proxy e2e", () => {
     expect(chatBody.provider).toEqual({ data_collection: "deny" });
     expect("stop" in chatBody).toBe(false);
     expect(chat.userAgent).toContain("ai-sdk/openai-compatible");
+  });
+
+  test("a waiting-room chat admits the free session once and answers 200 on the retry", async () => {
+    failNextChat = true;
+    const start = recorded.length;
+    const res = await fetch(`http://127.0.0.1:${port}/v1/messages`, {
+      method: "POST",
+      headers: { "x-api-key": inferenceKey, "content-type": "application/json" },
+      body: JSON.stringify({
+        model: CHAT_KEY,
+        max_tokens: 64,
+        stream: false,
+        messages: [{ role: "user", content: "say hi" }],
+      }),
+    });
+    expect(res.status).toBe(200);
+    const body: any = await res.json();
+    expect(body.type).toBe("message");
+    const slice = recorded.slice(start);
+    const chats = slice.filter((r) => r.path === "/api/v1/chat/completions");
+    expect(chats).toHaveLength(2);
+    expect((chats[0]!.body as any).model).toBe(CHAT_HANDLE);
+    expect((chats[1]!.body as any).model).toBe(CHAT_HANDLE);
+    const admissionIndex = slice.findIndex((r) => r.path === "/api/v1/freebuff/session/admission");
+    expect(admissionIndex).toBeGreaterThan(slice.indexOf(chats[0]!));
+    expect(admissionIndex).toBeLessThan(slice.indexOf(chats[1]!));
+    const admission = slice[admissionIndex]!;
+    expect(admission.modelHeader).toBe(CHAT_HANDLE);
+    expect(admission.fetchHeader).toBe("fbf1.e2e");
+    expect(admission.instanceHeader).toMatch(/^cli:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
   });
 
   test("streaming inference converts openai sse to anthropic sse events, the model addressed by slug", async () => {

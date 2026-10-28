@@ -12,10 +12,13 @@ export type HeaderPair = [name: string, value: string];
 
 const ACCEPT_ENCODING = "gzip, deflate";
 
+/** The client release whose wire this proxy speaks; its bundle's sha256 is 5d9f18b5a56ac80e457547ca3859766a28fd8ddd32c396492f2cdb28b92507e2. */
+export const CLI_VERSION = "0.2.34";
+
 const USER_AGENTS: Record<HeaderClass, string> = {
   api: "Bun/1.3.14",
   chat: "ai-sdk/openai-compatible/0.0.0-test/codebuff ai-sdk/provider-utils/3.0.25 runtime/browser",
-  cli: "Freebuff-CLI/0.2.34",
+  cli: `Freebuff-CLI/${CLI_VERSION}`,
 };
 
 /** The base set + Authorization + the class's user agent; `extra` rides last.
@@ -99,6 +102,7 @@ export function retryAfterSeconds(res: { headers: { get(name: string): string | 
 export const CHAT_PATH = "/api/v1/chat/completions";
 export const MODELS_PATH = "/api/v1/freebuff/models";
 export const SESSION_PATH = "/api/v1/freebuff/session";
+export const ADMISSION_PATH = "/api/v1/freebuff/session/admission";
 export const AGENT_RUNS_PATH = "/api/v1/agent-runs";
 export const STREAK_PATH = "/api/v1/freebuff/streak";
 export const CLI_LOGIN_CODE_PATH = "/api/auth/cli/code";

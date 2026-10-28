@@ -13,6 +13,7 @@ interface RecordedRequest {
   authorization: string | null;
   instanceHeader: string | null;
   catalogHeader: string | null;
+  headers: Record<string, string>;
   body: any;
   at: number;
 }
@@ -20,6 +21,7 @@ interface RecordedRequest {
 interface StubRoutes {
   models?: () => Response;
   deleteSession?: () => Response;
+  admission?: () => Response;
   agentRun?: (body: any) => Response | Promise<Response>;
   chat?: (body: any) => Response;
 }
@@ -33,6 +35,7 @@ const CLI_INSTANCE_RE = /^cli:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0
 
 const CATALOGUE_BODY = {
   version: "v0.test.1",
+  fetchId: "fbf1.test",
   rows: [{ key: KEY, handle: HANDLE, displayName: "MiMo v2.6 Flash Slow", access: "open", dataUse: "service", premium: false }],
 };
 
@@ -53,11 +56,15 @@ describe("sessions and runs", () => {
           authorization: req.headers.get("authorization"),
           instanceHeader: req.headers.get("x-freebuff-instance-id"),
           catalogHeader: req.headers.get("x-freebuff-catalog-protocol"),
+          headers: Object.fromEntries(req.headers),
           body,
           at: Date.now(),
         });
         if (url.pathname === "/api/v1/freebuff/models" && req.method === "GET") {
           return routes.models?.() ?? Response.json(CATALOGUE_BODY);
+        }
+        if (url.pathname === "/api/v1/freebuff/session/admission" && req.method === "POST") {
+          return routes.admission?.() ?? Response.json({ status: "active", model: KEY });
         }
         if (url.pathname === "/api/v1/freebuff/session" && req.method === "DELETE") {
           return routes.deleteSession?.() ?? new Response(null, { status: 204 });
@@ -86,6 +93,7 @@ describe("sessions and runs", () => {
       token: TOKEN,
       model: KEY,
       handle: HANDLE,
+      fetchId: "fbf1.test",
       body: { model: HANDLE, messages: [{ role: "user", content: "hi" }], stream: false },
       gapMs,
     });
@@ -198,6 +206,108 @@ describe("sessions and runs", () => {
     expect((thrown as Error).message).toContain("minimax/minimax-m3");
     expect((thrown as Error).message).toContain(KEY);
     expect(recorded.filter((r) => r.path === "/api/v1/chat/completions")).toHaveLength(2);
+  });
+
+  test("a waiting_room_required chat admits a session once and retries on the admitted model", async () => {
+    recorded = [];
+    let chatCalls = 0;
+    routes = {
+      chat: () => {
+        chatCalls += 1;
+        if (chatCalls === 1) {
+          return Response.json(
+            { error: "waiting_room_required", message: "Your free session has ended. Send your message again to start a new one." },
+            { status: 428 },
+          );
+        }
+        return Response.json({ ok: true });
+      },
+    };
+    const attempt = await chatOnce("acct-admission");
+    expect(attempt.response.status).toBe(200);
+    expect(recorded.map((r) => `${r.method} ${r.path}`)).toEqual([
+      "POST /api/v1/agent-runs",
+      "POST /api/v1/chat/completions",
+      "POST /api/v1/freebuff/session/admission",
+      "POST /api/v1/chat/completions",
+    ]);
+    const admission = recorded.find((r) => r.path === "/api/v1/freebuff/session/admission")!;
+    const instanceId = instanceIdOf("acct-admission");
+    expect(admission.headers["x-freebuff-model"]).toBe(HANDLE);
+    expect(admission.headers["x-freebuff-instance-id"]).toBe(instanceId);
+    expect(admission.headers["x-freebuff-desktop-attempt-id"]).toBe(instanceId.replace(/^cli:/, ""));
+    expect(admission.headers["x-freebuff-desktop-attempt-id"]).toMatch(UUID_RE);
+    expect(admission.headers["x-freebuff-multi-session"]).toBe("1");
+    expect(admission.headers["x-freebuff-purchase-continuity"]).toBe("1");
+    expect(admission.headers["x-freebuff-wallet-spend-limit"]).toBe("session");
+    expect(admission.headers["x-freebuff-client"]).toBe("cli");
+    expect(admission.headers["x-freebuff-client-version"]).toBe("0.2.34");
+    expect(admission.headers["x-freebuff-catalog-protocol"]).toBe("1");
+    expect(admission.headers["x-freebuff-catalog-fetch"]).toBe("fbf1.test");
+    expect(admission.authorization).toBe(`Bearer ${TOKEN}`);
+    expect(recorded.some((r) => r.method === "DELETE")).toBe(false);
+    const chats = recorded.filter((r) => r.path === "/api/v1/chat/completions");
+    expect(chats[1]!.body.model).toBe(HANDLE);
+  });
+
+  test("a waiting room that survives the admission fails with its own error, one admission only", async () => {
+    recorded = [];
+    routes = {
+      chat: () =>
+        Response.json({ error: "waiting_room_required", message: "Your free session has ended. Send your message again to start a new one." }, { status: 428 }),
+    };
+    let thrown: unknown = null;
+    try {
+      await chatOnce("acct-admission-persist");
+    } catch (err) {
+      thrown = err;
+    }
+    expect(thrown).toBeInstanceOf(Error);
+    expect((thrown as Error).message).toContain("waiting_room_required");
+    expect(recorded.filter((r) => r.path === "/api/v1/freebuff/session/admission")).toHaveLength(1);
+    expect(recorded.filter((r) => r.path === "/api/v1/chat/completions")).toHaveLength(2);
+  });
+
+  test("an admission the upstream refuses fails naming the admission and its status", async () => {
+    recorded = [];
+    routes = {
+      chat: () => Response.json({ error: "waiting_room_required" }, { status: 428 }),
+      admission: () => Response.json({ error: "rate_limited" }, { status: 429 }),
+    };
+    let thrown: unknown = null;
+    try {
+      await chatOnce("acct-admission-refused");
+    } catch (err) {
+      thrown = err;
+    }
+    expect(thrown).toBeInstanceOf(Error);
+    expect((thrown as Error).message).toContain("session admission");
+    expect((thrown as Error).message).toContain("429");
+    expect(recorded.filter((r) => r.path === "/api/v1/chat/completions")).toHaveLength(1);
+  });
+
+  test("an admission without a catalogue fetchId omits the fetch header", async () => {
+    recorded = [];
+    let chatCalls = 0;
+    routes = {
+      chat: () => {
+        chatCalls += 1;
+        if (chatCalls === 1) return Response.json({ error: "waiting_room_required" }, { status: 428 });
+        return Response.json({ ok: true });
+      },
+    };
+    const attempt = await runChat({
+      accountId: "acct-admission-nofetch",
+      token: TOKEN,
+      model: KEY,
+      handle: HANDLE,
+      fetchId: null,
+      body: { model: HANDLE, messages: [{ role: "user", content: "hi" }], stream: false },
+      gapMs: 0,
+    });
+    expect(attempt.response.status).toBe(200);
+    const admission = recorded.find((r) => r.path === "/api/v1/freebuff/session/admission")!;
+    expect("x-freebuff-catalog-fetch" in admission.headers).toBe(false);
   });
 
   test("a freebuff_catalog_stale chat refetches the catalogue once and retries with the fresh handle", async () => {
