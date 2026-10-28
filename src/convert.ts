@@ -761,12 +761,14 @@ function handleChunkUsage(root: Record<string, unknown>, state: StreamState): vo
  * Rebuild an openai SSE body as anthropic SSE events. `onUsage` feeds the
  * stats counters once with the last usage the stream carried — openai's
  * trailing usage-only chunk is the authoritative total, so an earlier
- * usage-bearing chunk never double-counts.
+ * usage-bearing chunk never double-counts. `onModel` reports the upstream
+ * model id once when the stream's chunks name one.
  */
 export function convertOpenAiSse(
   upstream: ReadableStream<Uint8Array>,
   requestedModel: string,
   onUsage?: (tokens: ObservedTokens) => void,
+  onModel?: (model: string) => void,
 ): ReadableStream<Uint8Array> {
   const encoder = new TextEncoder();
   const state: StreamState = {
@@ -795,6 +797,7 @@ export function convertOpenAiSse(
         finalContentEvents(state, emit);
         messageDeltaAndStop(state, emit, state.lastUsage);
         if (state.lastUsage !== null && onUsage !== undefined) onUsage(extractUsage(state.lastUsage));
+        if (state.model !== "" && state.model !== requestedModel && onModel !== undefined) onModel(state.model);
       };
       const decoder = new TextDecoder();
       let buffered = "";

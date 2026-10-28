@@ -13,6 +13,9 @@ const CATALOGUE_ROWS = [
 ];
 const CHAT_KEY = "m-61c26317cc";
 const CHAT_HANDLE = "fbm1.e2e.aaaa";
+/** The upstream model id the chat answer reports; the rate-limit pools key on it. */
+const UPSTREAM_MODEL = "e2e/mimo-v2.6";
+const POOL_RESET = "2026-10-29T07:00:00.000Z";
 
 type RecordedRequest = {
   method: string;
@@ -34,6 +37,9 @@ let loginUserToken: string | null = null;
 
 /** Answer the next chat with the waiting-room 428, then answer normally again. */
 let failNextChat = false;
+
+/** Another instance holds the purchase: chats 428 until the admission 409s. */
+let sessionConflict = false;
 
 function makeStubUpstream(recorded: RecordedRequest[]): { port: number; stop: () => void } {
   const server = Bun.serve({
@@ -58,6 +64,20 @@ function makeStubUpstream(recorded: RecordedRequest[]): { port: number; stop: ()
         return Response.json({ protocol: 1, version: "v0.e2e.1", fetchId: "fbf1.e2e", rows: CATALOGUE_ROWS });
       }
       if (req.method === "POST" && url.pathname === "/api/v1/freebuff/session/admission") {
+        if (sessionConflict) {
+          return Response.json(
+            {
+              status: "purchase_in_use",
+              accessTier: "limited",
+              requestedModel: CHAT_KEY,
+              currentInstanceId: "cli:267b8c1a-0bbc-4320-842e-3e09e1fc910d",
+              desktopSessionCounts: { premium: 1, unlimited: 0, nextExpiryAt: "2026-10-30T00:00:00.000Z" },
+              desktopPurchases: [{ model: CHAT_KEY, expiresAt: "2026-10-29T00:00:00.000Z", holderInstanceId: "cli:267b8c1a-0bbc-4320-842e-3e09e1fc910d" }],
+              desktopRefunds: [],
+            },
+            { status: 409 },
+          );
+        }
         return Response.json({ status: "active", model: CHAT_KEY });
       }
       if (req.method === "POST" && url.pathname === "/api/auth/cli/code") {
@@ -80,21 +100,32 @@ function makeStubUpstream(recorded: RecordedRequest[]): { port: number; stop: ()
         return Response.json({ ok: true });
       }
       if (url.pathname === "/api/v1/freebuff/session") {
-        if (req.method === "POST" || req.method === "GET") {
+        if (req.method === "GET") {
+          // the measured 2026-10-28 wire: no session fields at all, the daily
+          // pools under rateLimitsByModel
           return Response.json({
-            status: "active",
-            instanceId: "inst-1",
-            expiresAt: new Date(Date.now() + 3_600_000).toISOString(),
-            remainingMs: 3_600_000,
-            accessTier: "free",
-            countryCode: "DE",
-            model: CHAT_KEY,
+            status: "none",
+            accessTier: "limited",
+            freebucks: { daily: { limit: 20, spent: 5, remaining: 15, resetAt: POOL_RESET } },
+            rateLimitsByModel: {
+              [UPSTREAM_MODEL]: {
+                model: UPSTREAM_MODEL,
+                limit: 6,
+                recentCount: 2,
+                period: "pacific_day",
+                // an offset form of POOL_RESET: the figure must normalize it
+                resetAt: "2026-10-29T00:00:00.000-07:00",
+                resetTimeZone: "America/Los_Angeles",
+                windowHours: 24,
+              },
+            },
           });
         }
+        if (req.method === "POST") return Response.json({ status: "active", model: CHAT_KEY });
         if (req.method === "DELETE") return new Response(null, { status: 204 });
       }
       if (req.method === "POST" && url.pathname === "/api/v1/chat/completions") {
-        if (failNextChat) {
+        if (failNextChat || sessionConflict) {
           failNextChat = false;
           return Response.json(
             { error: "waiting_room_required", message: "Your free session has ended. Send your message again to start a new one." },
@@ -102,8 +133,7 @@ function makeStubUpstream(recorded: RecordedRequest[]): { port: number; stop: ()
           );
         }
         const parsed = JSON.parse(body!);
-        const selected = CATALOGUE_ROWS.find((row) => row.handle === parsed.model);
-        const model = selected?.key ?? CHAT_KEY;
+        const model = UPSTREAM_MODEL;
         if (parsed.stream === true) {
           const sse = [
             openaiChunk({ role: "assistant" }, null, model),
@@ -327,7 +357,7 @@ describe("freebuff proxy e2e", () => {
     const body: any = await res.json();
     expect(body.type).toBe("message");
     expect(body.role).toBe("assistant");
-    expect(body.model).toBe(CHAT_KEY);
+    expect(body.model).toBe(UPSTREAM_MODEL);
     expect(body.stop_reason).toBe("tool_use");
     expect(body.content).toEqual([
       { type: "tool_use", id: "call_1", name: "get_weather", input: { city: "SF" } },
@@ -406,7 +436,7 @@ describe("freebuff proxy e2e", () => {
     const events = sseEvents(raw);
     const names = events.map((e) => e.event);
     expect(names[0]).toBe("message_start");
-    expect((events[0]!.data as any).message.model).toBe(CHAT_KEY);
+    expect((events[0]!.data as any).message.model).toBe(UPSTREAM_MODEL);
     expect(names).toContain("content_block_start");
     expect(names.filter((n) => n === "content_block_delta").length).toBe(2);
     const deltas = events.filter((e) => e.event === "content_block_delta");
@@ -428,15 +458,52 @@ describe("freebuff proxy e2e", () => {
     expect(await res.json()).toEqual({ input_tokens: 53 });
   });
 
-  test("usage reads the session window and stats figures", async () => {
+  test("a purchase_in_use admission answers 409 with the upstream body, no retry", async () => {
+    sessionConflict = true;
+    const start = recorded.length;
+    try {
+      const res = await fetch(`http://127.0.0.1:${port}/v1/messages`, {
+        method: "POST",
+        headers: { "x-api-key": inferenceKey, "content-type": "application/json" },
+        body: JSON.stringify({
+          model: CHAT_KEY,
+          max_tokens: 64,
+          stream: false,
+          messages: [{ role: "user", content: "say hi" }],
+        }),
+      });
+      expect(res.status).toBe(409);
+      const body: any = await res.json();
+      expect(body).toEqual({
+        type: "error",
+        error: {
+          type: "api_error",
+          message:
+            "another freebuff instance holds this account's live session (cli:267b8c1a-0bbc-4320-842e-3e09e1fc910d) until 2026-10-29T00:00:00.000Z; this instance cannot chat until that session ends",
+        },
+      });
+      const slice = recorded.slice(start);
+      expect(slice.filter((r) => r.path === "/api/v1/freebuff/session/admission")).toHaveLength(1);
+      expect(slice.filter((r) => r.path === "/api/v1/chat/completions")).toHaveLength(1);
+    } finally {
+      sessionConflict = false;
+    }
+  });
+
+  test("usage reads the daily session pool and stats figures", async () => {
     const usage: any = await (await fetch(`http://127.0.0.1:${port}/clauth/v1/usage`, { headers: { authorization: adminAuth } })).json();
     const account = usage.accounts.find((entry: any) => entry.account === pasteAccountId);
     expect(account).toBeDefined();
     expect(account.state).toBe("ready");
-    const window = account.figures.find((f: any) => f.kind === "window");
-    expect(window).toBeDefined();
-    expect(window.unit).toBe("percent");
-    expect(window.resets_at).toBeTruthy();
+    const pool = account.figures.find((f: any) => f.kind === "window");
+    expect(pool).toBeDefined();
+    expect(pool.id).toBe("session");
+    expect(pool.unit).toBe("custom");
+    expect(pool.unit_label).toBe("sessions");
+    expect(pool.used).toBe(2);
+    expect(pool.limit).toBe(6);
+    expect(pool.window_secs).toBe(86400);
+    expect(pool.resets_at).toBe(POOL_RESET);
     const stats = account.figures.find((f: any) => f.kind === "stats");
     expect(stats).toBeDefined();
     expect(stats.requests.attempted).toBeGreaterThanOrEqual(2);

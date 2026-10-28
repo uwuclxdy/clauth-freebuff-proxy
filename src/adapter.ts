@@ -1,8 +1,8 @@
 /**
  * The freebuff adapter: the manifest the core serves from, the login doors
  * (src/login.ts), the anthropic↔openai forward over the run chain
- * (src/sessions.ts + src/convert.ts), the session-window and stats
- * figures, and the `end-session` action.
+ * (src/sessions.ts + src/convert.ts), the session-pool and stats figures, and
+ * the `end-session` action.
  */
 
 import {
@@ -26,13 +26,10 @@ import { dropAccount } from "./sessions.ts";
 import { loginCancel, loginPaste, loginPoll, loginStart, tokenFromBlob } from "./login.ts";
 import { resolveRow } from "./models.ts";
 import { SESSION_PATH, upstreamRequestJson } from "./transport.ts";
-import { catalogueOf, endAccountSessions, instanceIdOf, requestGapMs, runChat } from "./sessions.ts";
+import { catalogueOf, chatModelOf, endAccountSessions, instanceIdOf, noteChatModel, requestGapMs, runChat } from "./sessions.ts";
 import { dropStats, recordTokens, statsCounters } from "./stats.ts";
 
-/** The freebuff session window's nominal length: one hour. */
-const WINDOW_SECS = 3600;
-const WINDOW_MS = WINDOW_SECS * 1000;
-/** The usage cache must see a fresh account's window before a client asks: the first poll lands on the first interval. */
+/** The usage cache must see a fresh account's figures before a client asks: the first poll lands on the first interval. */
 const USAGE_CADENCE_MS = 1000;
 
 function invalidRequest(message: string): Response {
@@ -63,7 +60,12 @@ async function forwardMessages(ctx: ForwardContext, token: string): Promise<Resp
     if (parsed.stream && attempt.response.ok) {
       const upstreamBody = attempt.response.body;
       if (upstreamBody === null) throw new AdapterError("upstream_unavailable", "chat: the upstream answer carried no body");
-      const converted = convertOpenAiSse(upstreamBody, row.key, (tokens) => recordTokens(ctx.accountId, tokens));
+      const converted = convertOpenAiSse(
+        upstreamBody,
+        row.key,
+        (tokens) => recordTokens(ctx.accountId, tokens),
+        (model) => noteChatModel(ctx.accountId, model),
+      );
       return new Response(
         converted.pipeThrough(
           new TransformStream<Uint8Array, Uint8Array>({
@@ -92,6 +94,7 @@ async function forwardMessages(ctx: ForwardContext, token: string): Promise<Resp
       });
     }
     recordTokens(ctx.accountId, openAiUsageOf(upstream));
+    noteChatModel(ctx.accountId, upstreamModelOf(upstream));
     return Response.json(toAnthropicMessage(upstream, row.key));
   } catch (err) {
     if (err instanceof ConvertError) return invalidRequest(err.message);
@@ -115,22 +118,42 @@ async function forward(ctx: ForwardContext): Promise<Response> {
   return forwardMessages(ctx, token);
 }
 
-interface SessionFigureBody {
-  status: string;
-  instanceId: string;
-  expiresAt: string;
-  remainingMs: number;
+/** The upstream model id a chat answer reported, or "" when it carried none. */
+function upstreamModelOf(raw: unknown): string {
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return "";
+  const model = (raw as Record<string, unknown>)["model"];
+  return typeof model === "string" ? model : "";
 }
 
-function readSessionFigureBody(raw: unknown): SessionFigureBody {
-  const body = typeof raw === "object" && raw !== null && !Array.isArray(raw) ? (raw as Record<string, unknown>) : {};
-  const stringAt = (key: string): string => (typeof body[key] === "string" ? (body[key] as string) : "");
-  const numberAt = (key: string): number => (typeof body[key] === "number" ? (body[key] as number) : 0);
+interface PoolEntry {
+  used: number;
+  limit: number;
+  windowSecs: number;
+  resetsAt: string | null;
+}
+
+/** The daily free-session pool the session answer reports for one upstream
+ * model. The pools key on the upstream model id, which only a chat answer
+ * names for a catalogue row, so the caller passes the id the last chat
+ * reported; without one the answer carries no readable pool. */
+function poolOf(raw: unknown, upstreamModel: string): PoolEntry | null {
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return null;
+  const pools = (raw as Record<string, unknown>)["rateLimitsByModel"];
+  if (typeof pools !== "object" || pools === null || Array.isArray(pools)) return null;
+  const entry = (pools as Record<string, unknown>)[upstreamModel];
+  if (typeof entry !== "object" || entry === null || Array.isArray(entry)) return null;
+  const record = entry as Record<string, unknown>;
+  const used = record["recentCount"];
+  const limit = record["limit"];
+  if (typeof used !== "number" || typeof limit !== "number" || limit <= 0) return null;
+  const hours = record["windowHours"];
+  // the core's figure schema takes only UTC timestamps; the upstream may send an offset
+  const resetMs = typeof record["resetAt"] === "string" ? Date.parse(record["resetAt"] as string) : Number.NaN;
   return {
-    status: stringAt("status"),
-    instanceId: stringAt("instanceId"),
-    expiresAt: stringAt("expiresAt"),
-    remainingMs: numberAt("remainingMs"),
+    used,
+    limit,
+    windowSecs: typeof hours === "number" && hours > 0 ? Math.round(hours * 3600) : 86_400,
+    resetsAt: Number.isFinite(resetMs) ? new Date(resetMs).toISOString() : null,
   };
 }
 
@@ -154,20 +177,20 @@ async function readFigures(ctx: ReadFiguresContext): Promise<unknown> {
   }
 
   const figures: unknown[] = [];
-  const session = readSessionFigureBody(body);
-  if (status === 200 && session.status === "active" && session.instanceId !== "") {
-    const used = Math.min(100, Math.max(0, Math.round(100 * (1 - session.remainingMs / WINDOW_MS))));
-    const resetsAt = Date.parse(session.expiresAt);
+  const upstreamModel = chatModelOf(ctx.accountId);
+  const pool = upstreamModel === null ? null : poolOf(body, upstreamModel);
+  if (status === 200 && pool !== null) {
     figures.push({
       kind: "window",
       id: "session",
-      label: "session window",
+      label: "daily session pool",
       read_at: readAt,
-      used,
-      limit: 100,
-      unit: "percent",
-      window_secs: WINDOW_SECS,
-      resets_at: Number.isFinite(resetsAt) ? new Date(resetsAt).toISOString() : null,
+      used: pool.used,
+      limit: pool.limit,
+      unit: "custom",
+      unit_label: "sessions",
+      window_secs: pool.windowSecs,
+      resets_at: pool.resetsAt,
     });
   }
   figures.push({
@@ -203,7 +226,7 @@ export const adapter: ProxyAdapter = {
     version: "0.0.0",
     capabilities: ["events", "count_tokens"],
     figures: [
-      { id: "session", kind: "window", label: "session window" },
+      { id: "session", kind: "window", label: "daily session pool" },
       { id: "stats", kind: "stats", label: "request stats" },
     ],
     settings: [

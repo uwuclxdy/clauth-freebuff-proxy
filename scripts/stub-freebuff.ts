@@ -29,23 +29,39 @@ const stats = { requests: 0, unmatched: 0, chats: 0, logins: 0 };
 
 /** The small two-row catalogue the stub serves; row 1 is the default open row. */
 const CATALOGUE_ROWS = [
-  { key: "m-61c26317cc", handle: "fbm1.stub.aaaa", displayName: "MiMo v2.6 Flash Slow", access: "open", dataUse: "service", premium: false },
-  { key: "m-9b8a7c6d5e", handle: "fbm1.stub.bbbb", displayName: "DeepSeek V4 Flash", access: "open", dataUse: "training", premium: true },
+  { key: "m-61c26317cc", handle: "fbm1.stub.aaaa", displayName: "MiMo v2.6 Flash Slow", access: "open", dataUse: "service", premium: false, upstreamModel: "stub/mimo-v2.6" },
+  { key: "m-9b8a7c6d5e", handle: "fbm1.stub.bbbb", displayName: "DeepSeek V4 Flash", access: "open", dataUse: "training", premium: true, upstreamModel: "stub/deepseek-v4" },
 ];
 const CHAT_KEY = CATALOGUE_ROWS[0]!.key;
+const POOL_RESET = "2026-10-30T07:00:00.000Z";
 
 /** The token a browser login would hand back once the harness says a user signed in. */
 let loginToken: string | null = null;
 const LOGIN_HASH = "a".repeat(64);
 
+/** The measured 2026-10-28 GET answer: no session fields, the daily pools
+ * under `rateLimitsByModel` keyed by upstream model id. */
+function sessionPoll(): Record<string, unknown> {
+  return {
+    status: "none",
+    accessTier: "limited",
+    freebucks: { daily: { limit: 20, spent: 5, remaining: 15, resetAt: POOL_RESET } },
+    rateLimitsByModel: Object.fromEntries(
+      CATALOGUE_ROWS.map((row) => [
+        row.upstreamModel,
+        { model: row.upstreamModel, limit: 6, recentCount: 2, period: "pacific_day", resetAt: POOL_RESET, resetTimeZone: "America/Los_Angeles", windowHours: 24 },
+      ]),
+    ),
+  };
+}
+
+/** The admission's own 200 answer. */
 function activeSession(): Record<string, unknown> {
   return {
     status: "active",
-    instanceId: "inst-1",
     expiresAt: new Date(Date.now() + 3_600_000).toISOString(),
     remainingMs: 3_600_000,
-    accessTier: "free",
-    countryCode: "DE",
+    accessTier: "limited",
     model: CHAT_KEY,
   };
 }
@@ -98,7 +114,8 @@ function route(method: string, path: string, bodyRaw: string | null): Response |
     });
   }
   if (path === "/api/v1/freebuff/session") {
-    if (method === "POST" || method === "GET") return Response.json(activeSession());
+    if (method === "GET") return Response.json(sessionPoll());
+    if (method === "POST") return Response.json(activeSession());
     if (method === "DELETE") return new Response(null, { status: 204 });
     return null;
   }
@@ -112,7 +129,7 @@ function route(method: string, path: string, bodyRaw: string | null): Response |
     stats.chats += 1;
     const parsed = bodyRaw === null ? {} : (JSON.parse(bodyRaw) as Record<string, unknown>);
     const stream = parsed["stream"] === true;
-    const model = selectedRow(parsed)?.key ?? CHAT_KEY;
+    const model = selectedRow(parsed)?.upstreamModel ?? CATALOGUE_ROWS[0]!.upstreamModel;
     if (stream) return new Response(sseAnswer(model), { headers: { "content-type": "text/event-stream" } });
     return Response.json({
       id: "chatcmpl-1",

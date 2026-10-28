@@ -48,6 +48,8 @@ interface AccountUpstream {
   instanceId: string | null;
   clientId: string | null;
   lastChatDialAt: number;
+  /** The upstream model id the account's last chat answer reported. */
+  chatModel: string | null;
 }
 
 const accounts = new Map<string, AccountUpstream>();
@@ -55,10 +57,22 @@ const accounts = new Map<string, AccountUpstream>();
 function accountState(accountId: string): AccountUpstream {
   let entry = accounts.get(accountId);
   if (entry === undefined) {
-    entry = { catalogue: null, instanceId: null, clientId: null, lastChatDialAt: 0 };
+    entry = { catalogue: null, instanceId: null, clientId: null, lastChatDialAt: 0, chatModel: null };
     accounts.set(accountId, entry);
   }
   return entry;
+}
+
+/** Remember the upstream model a chat answer reported; the rate-limit pools in
+ * the session answer key on it, and no other answer names the catalogue row's
+ * upstream model. */
+export function noteChatModel(accountId: string, upstreamModel: string): void {
+  if (upstreamModel !== "") accountState(accountId).chatModel = upstreamModel;
+}
+
+/** The upstream model id a chat answer reported, or null before the first chat. */
+export function chatModelOf(accountId: string): string | null {
+  return accounts.get(accountId)?.chatModel ?? null;
 }
 
 export const DEFAULT_REQUEST_GAP_MS = 1300;
@@ -163,8 +177,10 @@ export async function endAccountSessions(accountId: string, token: string): Prom
   await endSession(accountId, token, instanceIdOf(accountId));
 }
 
-/** Start the account's free session through the admission door; a non-2xx answer is upstream trouble. */
-async function admitSession(accountId: string, token: string, handle: string, fetchId: string | null): Promise<void> {
+/** Start the account's free session through the admission door. A 409 naming
+ * another instance's live purchase is the caller's own conflict, surfaced as
+ * the upstream answer; any other non-2xx answer is upstream trouble. */
+async function admitSession(accountId: string, token: string, handle: string, fetchId: string | null): Promise<Response | null> {
   const instanceId = instanceIdOf(accountId);
   const extra: HeaderPair[] = [
     ["x-freebuff-client", "cli"],
@@ -178,14 +194,20 @@ async function admitSession(accountId: string, token: string, handle: string, fe
     ["x-freebuff-catalog-protocol", CATALOG_PROTOCOL],
   ];
   if (fetchId !== null) extra.push(["x-freebuff-catalog-fetch", fetchId]);
-  const { status, retryAfter } = await countedJson(accountId, {
+  const { status, body, retryAfter } = await countedJson(accountId, {
     path: ADMISSION_PATH,
     method: "POST",
     token,
     headerClass: "cli",
     extraHeaders: extra,
   });
+  if (isPurchaseInUse(status, body)) {
+    // the core passes an anthropic-shaped error body through verbatim; any
+    // other body it rewrites to a generic message that drops the holder
+    return purchaseInUseResponse(body);
+  }
   if (status < 200 || status >= 300) throw upstreamFailure("session admission", status, retryAfter);
+  return null;
 }
 
 // ---- the run chain ----------------------------------------------------------
@@ -264,6 +286,31 @@ function isSessionModelMismatch(status: number, body: unknown): boolean {
 function isWaitingRoomRequired(status: number, body: unknown): boolean {
   if (status !== 428) return false;
   return JSON.stringify(body ?? "").includes("waiting_room_required");
+}
+
+/** Another instance holds the account's live purchase; the answer names it. */
+function isPurchaseInUse(status: number, body: unknown): boolean {
+  if (status !== 409) return false;
+  return JSON.stringify(body ?? "").includes("purchase_in_use");
+}
+
+/** The surfaced answer for a purchase_in_use conflict: an anthropic-shaped
+ * error, the only shape the core passes through verbatim. */
+function purchaseInUseResponse(body: unknown): Response {
+  return new Response(JSON.stringify({ type: "error", error: { type: "api_error", message: purchaseInUseMessage(body) } }), {
+    status: 409,
+    headers: { "content-type": "application/json" },
+  });
+}
+
+/** The holder the purchase_in_use answer names, for the surfaced error. */
+function purchaseInUseMessage(body: unknown): string {
+  const record = typeof body === "object" && body !== null && !Array.isArray(body) ? (body as Record<string, unknown>) : {};
+  const holder = typeof record["currentInstanceId"] === "string" ? record["currentInstanceId"] : "another instance";
+  const purchases = Array.isArray(record["desktopPurchases"]) ? record["desktopPurchases"] : [];
+  const first = purchases.length > 0 && typeof purchases[0] === "object" && purchases[0] !== null ? (purchases[0] as Record<string, unknown>) : null;
+  const expiresAt = first !== null && typeof first["expiresAt"] === "string" ? first["expiresAt"] : null;
+  return `another freebuff instance holds this account's live session (${holder})${expiresAt === null ? "" : ` until ${expiresAt}`}; this instance cannot chat until that session ends`;
 }
 
 /** The bound model a `session_model_mismatch` names. */
@@ -365,8 +412,16 @@ export async function runChat(plan: ChatPlan): Promise<ChatAttempt> {
         throw new AdapterError("upstream_unavailable", "chat: the admitted session still answers waiting_room_required");
       }
       retriedAdmission = true;
-      await admitSession(accountId, token, handle, fetchId);
+      const surfaced = await admitSession(accountId, token, handle, fetchId);
+      if (surfaced !== null) {
+        response = surfaced;
+        break;
+      }
       response = await postChat(accountId, token, assembleChatBody({ ...converted, model: handle }, runId, instanceIdOf(accountId), clientIdOf(accountId)), gapMs);
+    } else if (isPurchaseInUse(response.status, errorBody)) {
+      // a chat-answered conflict gets the same surfaced envelope as an admission's
+      response = purchaseInUseResponse(errorBody);
+      break;
     } else {
       response = rebuildJsonResponse(response, errorBody);
       break;

@@ -250,6 +250,67 @@ describe("sessions and runs", () => {
     expect(chats[1]!.body.model).toBe(HANDLE);
   });
 
+  test("a purchase_in_use admission surfaces the upstream 409 instead of failing the chat", async () => {
+    recorded = [];
+    const conflict = {
+      status: "purchase_in_use",
+      accessTier: "limited",
+      currentInstanceId: "cli:267b8c1a-0bbc-4320-842e-3e09e1fc910d",
+      requestedModel: KEY,
+      desktopPurchases: [
+        { model: KEY, expiresAt: "2026-10-28T22:42:34.864Z", holderInstanceId: "cli:267b8c1a-0bbc-4320-842e-3e09e1fc910d" },
+      ],
+      desktopRefunds: [],
+    };
+    routes = {
+      chat: () =>
+        Response.json({ error: "waiting_room_required", message: "Your free session has ended. Send your message again to start a new one." }, { status: 428 }),
+      admission: () => Response.json(conflict, { status: 409 }),
+    };
+    const attempt = await chatOnce("acct-purchase-in-use");
+    expect(attempt.response.status).toBe(409);
+    expect(await attempt.response.json()).toEqual({
+      type: "error",
+      error: {
+        type: "api_error",
+        message:
+          "another freebuff instance holds this account's live session (cli:267b8c1a-0bbc-4320-842e-3e09e1fc910d) until 2026-10-28T22:42:34.864Z; this instance cannot chat until that session ends",
+      },
+    });
+    expect(recorded.map((r) => `${r.method} ${r.path}`)).toEqual([
+      "POST /api/v1/agent-runs",
+      "POST /api/v1/chat/completions",
+      "POST /api/v1/freebuff/session/admission",
+    ]);
+  });
+
+  test("a chat-answered purchase_in_use gets the same surfaced 409", async () => {
+    recorded = [];
+    routes = {
+      chat: () =>
+        Response.json(
+          {
+            status: "purchase_in_use",
+            currentInstanceId: "cli:267b8c1a-0bbc-4320-842e-3e09e1fc910d",
+            desktopPurchases: [
+              { expiresAt: "2026-10-28T22:42:34.864Z", holderInstanceId: "cli:267b8c1a-0bbc-4320-842e-3e09e1fc910d" },
+            ],
+          },
+          { status: 409 },
+        ),
+    };
+    const attempt = await chatOnce("acct-chat-conflict");
+    expect(attempt.response.status).toBe(409);
+    expect(await attempt.response.json()).toEqual({
+      type: "error",
+      error: {
+        type: "api_error",
+        message:
+          "another freebuff instance holds this account's live session (cli:267b8c1a-0bbc-4320-842e-3e09e1fc910d) until 2026-10-28T22:42:34.864Z; this instance cannot chat until that session ends",
+      },
+    });
+  });
+
   test("a waiting room that survives the admission fails with its own error, one admission only", async () => {
     recorded = [];
     routes = {
