@@ -164,12 +164,14 @@ describe("the recording relay", () => {
 });
 
 describe("the figures read", () => {
-  test("requires the session window and the stats figure", async () => {
+  test("requires the session pool and the stats figure", async () => {
     const both = serveJson({ accounts: [{ figures: [{ id: "session" }, { id: "stats" }] }] });
     const statsOnly = serveJson({ accounts: [{ figures: [{ id: "stats" }] }] });
     try {
       expect(await readFigures(`http://127.0.0.1:${both.port}`, [TOKEN])).toHaveLength(2);
-      await expect(readFigures(`http://127.0.0.1:${statsOnly.port}`, [TOKEN])).rejects.toThrow("no session figure");
+      await expect(readFigures(`http://127.0.0.1:${statsOnly.port}`, [TOKEN], { windowMs: 50 })).rejects.toThrow(
+        /^usage read never carried session \+ stats within 50ms; figures seen: stats$/,
+      );
     } finally {
       both.stop(true);
       statsOnly.stop(true);

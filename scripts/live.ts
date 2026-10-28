@@ -195,16 +195,24 @@ function assertAnthropicSse(text: string): void {
   }
 }
 
-export async function readFigures(base: string, secrets: string[]): Promise<unknown[]> {
-  const res = await fetch(`${base}/clauth/v1/usage`, { headers: adminAuthOf(ADMIN_TOKEN), signal: AbortSignal.timeout(30_000) });
-  const text = await res.text();
-  if (res.status !== 200) throw new HarnessError(`usage read answered ${res.status}: ${scrubSecrets(text.slice(0, 500), secrets)}`);
-  const figures = (JSON.parse(text) as { accounts?: Array<{ figures?: Array<{ id?: string }> }> }).accounts?.[0]?.figures ?? [];
-  const ids = figures.map((figure) => figure.id);
-  for (const required of REQUIRED_FIGURES) {
-    if (!ids.includes(required)) throw new HarnessError(`usage read carried no ${required} figure`);
+/** The usage read serves the core's usage cache, which refreshes only on its
+ * poll interval, so a read right after the first chats can serve an entry that
+ * predates the account's first upstream session; poll until both figures land. */
+export async function readFigures(base: string, secrets: string[], opts: { windowMs?: number } = {}): Promise<unknown[]> {
+  const windowMs = opts.windowMs ?? 15_000;
+  const deadline = Date.now() + windowMs;
+  let seen: Array<string | undefined> = [];
+  while (Date.now() < deadline) {
+    const res = await fetch(`${base}/clauth/v1/usage`, { headers: adminAuthOf(ADMIN_TOKEN), signal: AbortSignal.timeout(30_000) });
+    const text = await res.text();
+    if (res.status !== 200) throw new HarnessError(`usage read answered ${res.status}: ${scrubSecrets(text.slice(0, 500), secrets)}`);
+    const figures = (JSON.parse(text) as { accounts?: Array<{ figures?: Array<{ id?: string }> }> }).accounts?.[0]?.figures ?? [];
+    const ids = figures.map((figure) => figure.id);
+    if (REQUIRED_FIGURES.every((required) => ids.includes(required))) return figures;
+    seen = ids;
+    await Bun.sleep(1000);
   }
-  return figures;
+  throw new HarnessError(`usage read never carried ${REQUIRED_FIGURES.join(" + ")} within ${windowMs}ms; figures seen: ${seen.length === 0 ? "none" : seen.map((id) => id ?? "<no id>").join(", ")}`);
 }
 
 export function captureDir(mode: CaptureMode, researchRoot = RESEARCH_ROOT): string {
@@ -288,6 +296,28 @@ async function main(): Promise<void> {
 
     writeCapture({ records, origin, figures, statuses: { plain: plain.status, streamed: streamed.status }, mode }, dir);
     process.stdout.write(`${mode.title} captured: ${records.filter((r) => r.direction === "request").length} upstream requests -> ${dir}\n`);
+  } catch (err) {
+    // a failed run's wire is the diagnostic; the original error stays the one
+    // reported, and the first failure's wire is kept over a later one's
+    try {
+      const failedDir = captureDir(mode);
+      const failedPath = join(failedDir, "run-failed.jsonl");
+      if (existsSync(failedPath)) {
+        process.stderr.write(`an earlier failed run's wire stays at ${failedPath}\n`);
+      } else {
+        mkdirSync(failedDir, { recursive: true });
+        writeFileSync(failedPath, records.map((record) => JSON.stringify(record)).join("\n") + "\n");
+        process.stderr.write(`records kept: ${failedPath}\n`);
+      }
+    } catch (writeErr) {
+      // the diagnostic write failed; say so without masking the run's own error
+      try {
+        process.stderr.write(`failed-wire capture failed: ${writeErr instanceof Error ? writeErr.message : String(writeErr)}\n`);
+      } catch {
+        // stderr itself is gone; the run's error below is still the one thrown
+      }
+    }
+    throw err;
   } finally {
     relay.stop();
     await runtime.teardown();
