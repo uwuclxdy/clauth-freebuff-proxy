@@ -7,6 +7,8 @@
  * neither harness expects.
  */
 
+import { randomUUID } from "node:crypto";
+
 const PORT = Number(process.env.STUB_PORT);
 if (!Number.isInteger(PORT) || PORT <= 0) {
   console.error("stub: STUB_PORT must be a port number");
@@ -102,7 +104,9 @@ function route(method: string, path: string, bodyRaw: string | null): Response |
   }
   if (path === "/api/v1/agent-runs" && method === "POST") {
     const action = bodyRaw === null ? "" : ((JSON.parse(bodyRaw) as Record<string, unknown>)["action"] ?? "");
-    return Response.json(action === "START" ? { runId: "run-1" } : {});
+    // a capture-shaped run id: the parity comparator pins the FINISH body's
+    // and the chat metadata's run id as a uuid
+    return Response.json(action === "START" ? { runId: randomUUID() } : {});
   }
   if (path === "/api/v1/chat/completions" && method === "POST") {
     stats.chats += 1;
