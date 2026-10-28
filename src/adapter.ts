@@ -1,7 +1,7 @@
 /**
  * The freebuff adapter: the manifest the core serves from, the login doors
- * (src/login.ts), the anthropic↔openai forward over the sessionless run
- * chain (src/sessions.ts + src/convert.ts), the session-window and stats
+ * (src/login.ts), the anthropic↔openai forward over the run chain
+ * (src/sessions.ts + src/convert.ts), the session-window and stats
  * figures, and the `end-session` action.
  */
 

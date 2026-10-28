@@ -1,5 +1,6 @@
 /**
- * The per-account upstream state and the sessionless chat run chain: the
+ * The per-account upstream state and the chat run chain — sessionless until a
+ * 428 asks for one admission: the
  * model catalogue fetched once per account (a 409 `freebuff_catalog_stale`
  * asks for one refetch), the locally minted `cli:` instance id every chat
  * and the session figure ride, one agent run per chat (START → chat →
@@ -310,7 +311,7 @@ export interface ChatAttempt {
 }
 
 /**
- * One sessionless chat on the account's behalf: a fresh agent run, the POST
+ * One chat on the account's behalf: a fresh agent run, the POST
  * behind the account's dial gate, and one bounded retry per error class — a
  * dead run (`runid not found`/`runid not running`), a stale catalogue
  * (`freebuff_catalog_stale`, one refetch), a `session_model_mismatch`
